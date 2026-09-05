@@ -1,0 +1,7 @@
+{
+  "uuid": "utm-dnd-target@utmapp.dev",
+  "name": "UTM DnD Target Inspector",
+  "description": "Semantic drop-target inspection for UTM",
+  "shell-version": ["50"],
+  "version": 1
+}

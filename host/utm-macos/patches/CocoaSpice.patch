@@ -1,0 +1,641 @@
+diff --git a/Sources/CocoaSpice/CSConnection.m b/Sources/CocoaSpice/CSConnection.m
+index 936842de1e098bcae964a4fe719b7b831d9deb06..3c3ed673d8205c47c8d629570003ba1a203b37a9 100644
+--- a/Sources/CocoaSpice/CSConnection.m
++++ b/Sources/CocoaSpice/CSConnection.m
+@@ -18,6 +18,7 @@
+ #import "CSChannel+Protected.h"
+ #import "CSCursor+Protected.h"
+ #import "CSDisplay+Protected.h"
++#import "CSFileTransfer+Protected.h"
+ #import "CSInput+Protected.h"
+ #import "CSSession+Protected.h"
+ #import "CSPort+Protected.h"
+@@ -38,6 +39,7 @@
+ @property (nonatomic, readwrite) SpiceSession *spiceSession;
+ @property (nonatomic, readwrite) SpiceMainChannel *spiceMain;
+ @property (nonatomic, readwrite) SpiceAudio *spiceAudio;
++@property (nonatomic) NSMutableSet<CSFileTransfer *> *activeFileTransfers;
+ 
+ @end
+ 
+@@ -265,6 +267,13 @@ static void cs_channel_destroy(SpiceSession *s, SpiceChannel *channel, gpointer
+     if (SPICE_IS_MAIN_CHANNEL(channel)) {
+         SPICE_DEBUG("[CocoaSpice] %s:%d", __FUNCTION__, __LINE__);
+         SPICE_DEBUG("zap main channel");
++        NSArray<CSFileTransfer *> *activeFileTransfers;
++        @synchronized (self.activeFileTransfers) {
++            activeFileTransfers = self.activeFileTransfers.allObjects;
++        }
++        for (CSFileTransfer *transfer in activeFileTransfers) {
++            [transfer cancel];
++        }
+         self.spiceMain = NULL;
+         g_signal_handlers_disconnect_by_func(channel, G_CALLBACK(cs_main_channel_event), (__bridge void *)self);
+         g_signal_handlers_disconnect_by_func(channel, G_CALLBACK(cs_main_agent_update), (__bridge void *)self);
+@@ -432,6 +441,7 @@ end:
+ #endif
+     self.session = [[CSSession alloc] initWithSession:self.spiceSession];
+     self.mutableChannels = [NSMutableArray<CSChannel *> array];
++    self.activeFileTransfers = [NSMutableSet set];
+ }
+ 
+ - (instancetype)initWithHost:(NSString *)host port:(NSString *)port {
+@@ -473,7 +483,51 @@ end:
+ }
+ 
+ - (void)disconnect {
++    NSArray<CSFileTransfer *> *activeFileTransfers;
++    @synchronized (self.activeFileTransfers) {
++        activeFileTransfers = self.activeFileTransfers.allObjects;
++    }
++    for (CSFileTransfer *transfer in activeFileTransfers) {
++        [transfer cancel];
++    }
+     spice_session_disconnect(self.spiceSession);
+ }
+ 
++- (CSFileTransfer *)transferFiles:(NSArray<NSURL *> *)urls
++                          progress:(CSFileTransferProgressHandler)progress
++                        completion:(CSFileTransferCompletionHandler)completion {
++    if (urls.count == 0 || [urls indexOfObjectPassingTest:^BOOL(NSURL *url, NSUInteger index, BOOL *stop) {
++        return !url.isFileURL || !url.fileSystemRepresentation;
++    }] != NSNotFound) {
++        NSError *error = [NSError errorWithDomain:CSFileTransferErrorDomain
++                                             code:CSFileTransferErrorInvalidSource
++                                         userInfo:@{ NSLocalizedDescriptionKey: NSLocalizedString(@"Only local file URLs can be transferred.", @"CSConnection") }];
++        dispatch_async(dispatch_get_main_queue(), ^{
++            completion(error);
++        });
++        return nil;
++    }
++
++    __weak typeof(self) weakSelf = self;
++    CSFileTransfer *transfer = [[CSFileTransfer alloc] initWithURLs:urls
++                                                   progressHandler:progress
++                                                completionHandler:completion
++                                                   cleanupHandler:^(CSFileTransfer *finishedTransfer) {
++        typeof(self) self = weakSelf;
++        if (self) {
++            @synchronized (self.activeFileTransfers) {
++                [self.activeFileTransfers removeObject:finishedTransfer];
++            }
++        }
++    }];
++    @synchronized (self.activeFileTransfers) {
++        [self.activeFileTransfers addObject:transfer];
++    }
++
++    [CSMain.sharedInstance asyncWith:^{
++        [transfer startWithMainChannel:self.spiceMain];
++    }];
++    return transfer;
++}
++
+ @end
+diff --git a/Sources/CocoaSpice/CSPort.m b/Sources/CocoaSpice/CSPort.m
+index 2cf253ddc77e06fe0cc4836016c0280a5791aee5..84550e8660fcb10ce345b2bc84072fcbe5f631ea 100644
+--- a/Sources/CocoaSpice/CSPort.m
++++ b/Sources/CocoaSpice/CSPort.m
+@@ -27,9 +27,21 @@ static const NSInteger kMaxCacheBufferSize = 4096;
+ @property (nonatomic, readwrite, weak) CSConnection *connection;
+ @property (nonatomic) NSMutableData *cacheBuffer;
+ @property (nonatomic) dispatch_queue_t portDataQueue;
++@property (atomic, nullable, copy) NSString *cachedName;
++@property (atomic) BOOL cachedOpen;
+ 
+ @end
+ 
++@interface CSPortWriteOperation : NSObject
++
++@property (nonatomic) CSPort *port;
++@property (nonatomic) NSData *data;
++
++@end
++
++@implementation CSPortWriteOperation
++@end
++
+ @implementation CSPort
+ 
+ #pragma mark - Channel event handlers
+@@ -38,8 +50,11 @@ static void cs_port_opened(SpiceChannel *channel, GParamSpec *pspec,
+                            gpointer user)
+ {
+     CSPort *self = (__bridge CSPort *)user;
++    gboolean opened = FALSE;
++    g_object_get(channel, "port-opened", &opened, NULL);
++    self.cachedOpen = opened;
+ 
+-    if (!self.isOpen) {
++    if (!opened) {
+         [self.delegate portDidDisconect:self];
+     }
+ }
+@@ -74,14 +89,16 @@ static void cs_port_write_cb(GObject *source_object,
+                              GAsyncResult *res,
+                              gpointer user_data)
+ {
+-    CSPort *self = (__bridge_transfer CSPort *)user_data;
++    CSPortWriteOperation *operation = (__bridge_transfer CSPortWriteOperation *)user_data;
++    CSPort *self = operation.port;
+     SpicePortChannel *port = SPICE_PORT_CHANNEL(source_object);
+     GError *error = NULL;
+ 
+     spice_port_channel_write_finish(port, res, &error);
+     if (error != NULL) {
+         g_warning("[CocoaSpice] %s", error->message);
+-        [self.delegate port:self didError:[NSString stringWithCString:error->message encoding:NSASCIIStringEncoding]];
++        NSString *message = [NSString stringWithUTF8String:error->message];
++        [self.delegate port:self didError:message ?: @"SPICE port write failed."];
+     }
+     g_clear_error(&error);
+ }
+@@ -93,6 +110,17 @@ static void cs_port_write_cb(GObject *source_object,
+         self.cacheBuffer = [NSMutableData data];
+         self.portDataQueue = dispatch_queue_create("CocoaSpice Port Data Queue", NULL);
+         self.channel = g_object_ref(channel);
++        gchar *name = NULL;
++        gboolean opened = FALSE;
++        g_object_get(channel,
++                     "port-name", &name,
++                     "port-opened", &opened,
++                     NULL);
++        if (name) {
++            self.cachedName = [NSString stringWithUTF8String:name];
++            g_free(name);
++        }
++        self.cachedOpen = opened;
+         g_signal_connect(channel, "notify::port-opened",
+                          G_CALLBACK(cs_port_opened), (__bridge void *)self);
+         g_signal_connect(channel, "port-data",
+@@ -121,27 +149,11 @@ static void cs_port_write_cb(GObject *source_object,
+ }
+ 
+ - (NSString *)name {
+-    NSString *nsname = nil;
+-    gchar *name = NULL;
+-    g_object_get(self.channel,
+-                 "port-name", &name,
+-                 NULL);
+-    if (!name) {
+-        return nil;
+-    }
+-    nsname = [NSString stringWithCString:name encoding:NSASCIIStringEncoding];
+-    g_free(name);
+-    return nsname;
++    return self.cachedName;
+ }
+ 
+ - (BOOL)isOpen {
+-    gboolean opened = FALSE;
+-
+-    g_object_get(self.channel,
+-                 "port-opened", &opened,
+-                 NULL);
+-    
+-    return opened;
++    return self.cachedOpen;
+ }
+ 
+ - (void)setDelegate:(id<CSPortDelegate>)delegate {
+@@ -157,8 +169,16 @@ static void cs_port_write_cb(GObject *source_object,
+ }
+ 
+ - (void)writeData:(NSData *)data {
++    CSPortWriteOperation *operation = [[CSPortWriteOperation alloc] init];
++    operation.port = self;
++    operation.data = [data copy];
+     [CSMain.sharedInstance asyncWith:^{
+-        spice_port_channel_write_async(self.channel, data.bytes, data.length, NULL, cs_port_write_cb, (__bridge_retained void *)self);
++        spice_port_channel_write_async(self.channel,
++                                       operation.data.bytes,
++                                       operation.data.length,
++                                       NULL,
++                                       cs_port_write_cb,
++                                       (__bridge_retained void *)operation);
+     }];
+ }
+ 
+diff --git a/Sources/CocoaSpice/include/CSConnection.h b/Sources/CocoaSpice/include/CSConnection.h
+index 0fee1bdbf5ad4103ffe471bcbbea4a922138ac5b..e95bafbd7a516905d2e9f8486c16269f86e78304 100644
+--- a/Sources/CocoaSpice/include/CSConnection.h
++++ b/Sources/CocoaSpice/include/CSConnection.h
+@@ -17,6 +17,7 @@
+ #import <Foundation/Foundation.h>
+ #import "CSConnectionDelegate.h"
+ #import "CSChannel.h"
++#import "CSFileTransfer.h"
+ 
+ @class CSDisplay;
+ @class CSUSBManager;
+@@ -87,6 +88,16 @@ NS_ASSUME_NONNULL_BEGIN
+ /// Request disconnect from SPICE server
+ - (void)disconnect;
+ 
++/// Transfer local files from the client to the SPICE guest agent.
++///
++/// The returned object represents the complete multi-file operation and may be
++/// used to cancel it. Progress and completion callbacks are delivered on the
++/// main queue. Returns `nil` when the source list is empty or contains a
++/// non-file URL; in that case completion is still delivered with an error.
++- (nullable CSFileTransfer *)transferFiles:(NSArray<NSURL *> *)urls
++                                  progress:(nullable CSFileTransferProgressHandler)progress
++                                completion:(CSFileTransferCompletionHandler)completion;
++
+ @end
+ 
+ NS_ASSUME_NONNULL_END
+diff --git a/Sources/CocoaSpice/include/CocoaSpice.h b/Sources/CocoaSpice/include/CocoaSpice.h
+index acc837bb6d00e827d376ddde9e4f6c9b4ef45298..cdd03a636a16806249bd3ca6b2475e86eb0bb72a 100644
+--- a/Sources/CocoaSpice/include/CocoaSpice.h
++++ b/Sources/CocoaSpice/include/CocoaSpice.h
+@@ -23,6 +23,7 @@
+ #include "CSCursor.h"
+ #include "CSDisplay.h"
+ #include "CSDisplay+Renderer.h"
++#include "CSFileTransfer.h"
+ #include "CSInput.h"
+ #include "CSMain.h"
+ #include "CSPasteboardDelegate.h"
+diff --git a/Sources/CocoaSpice/CSFileTransfer+Protected.h b/Sources/CocoaSpice/CSFileTransfer+Protected.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..11b869ff5ab7dd08c0626eb988eb917268d85c14
+--- /dev/null
++++ b/Sources/CocoaSpice/CSFileTransfer+Protected.h
+@@ -0,0 +1,37 @@
++//
++// Copyright © 2026 osy. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++#import "CSFileTransfer.h"
++
++typedef struct _SpiceMainChannel SpiceMainChannel;
++
++NS_ASSUME_NONNULL_BEGIN
++
++typedef void (^CSFileTransferCleanupHandler)(CSFileTransfer *transfer);
++
++@interface CSFileTransfer ()
++
++- (instancetype)initWithURLs:(NSArray<NSURL *> *)urls
++              progressHandler:(nullable CSFileTransferProgressHandler)progressHandler
++           completionHandler:(CSFileTransferCompletionHandler)completionHandler
++              cleanupHandler:(CSFileTransferCleanupHandler)cleanupHandler NS_DESIGNATED_INITIALIZER;
++
++/// Must be called on the CSMain GLib context.
++- (void)startWithMainChannel:(nullable SpiceMainChannel *)mainChannel;
++
++@end
++
++NS_ASSUME_NONNULL_END
+diff --git a/Sources/CocoaSpice/CSFileTransfer.m b/Sources/CocoaSpice/CSFileTransfer.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..910f1ee4d5da81c657e1c2a12a9aaf2f7a38b965
+--- /dev/null
++++ b/Sources/CocoaSpice/CSFileTransfer.m
+@@ -0,0 +1,274 @@
++//
++// Copyright © 2026 osy. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++#import "CSFileTransfer+Protected.h"
++#import <glib.h>
++#import <spice-client.h>
++#import <spice/vd_agent.h>
++
++NSErrorDomain const CSFileTransferErrorDomain = @"com.utmapp.CocoaSpice.FileTransfer";
++
++@interface CSFileTransfer ()
++
++@property (nonatomic, copy) NSArray<NSURL *> *urls;
++@property (nonatomic, nullable, copy) CSFileTransferProgressHandler progressHandler;
++@property (nonatomic, nullable, copy) CSFileTransferCompletionHandler completionHandler;
++@property (nonatomic, nullable, copy) CSFileTransferCleanupHandler cleanupHandler;
++
++@end
++
++
++@implementation CSFileTransfer {
++    SpiceMainChannel *_mainChannel;
++    GCancellable *_cancellable;
++    BOOL _cancelled;
++    BOOL _finished;
++    BOOL _progressDispatchPending;
++    uint64_t _latestCompleted;
++    uint64_t _latestTotal;
++}
++
++static NSError *cs_file_transfer_error(CSFileTransferError code, NSString *description) {
++    return [NSError errorWithDomain:CSFileTransferErrorDomain
++                               code:code
++                           userInfo:@{ NSLocalizedDescriptionKey: description }];
++}
++
++static NSError *cs_file_transfer_error_from_gerror(const GError *error) {
++    if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
++        return cs_file_transfer_error(CSFileTransferErrorCancelled,
++                                      NSLocalizedString(@"The file transfer was cancelled.", @"CSFileTransfer"));
++    }
++
++    NSString *description = error->message ? [NSString stringWithUTF8String:error->message] : nil;
++    if (!description) {
++        description = NSLocalizedString(@"The file transfer failed.", @"CSFileTransfer");
++    }
++
++    const gchar *domainName = g_quark_to_string(error->domain);
++    NSString *underlyingDomain = domainName ? [NSString stringWithUTF8String:domainName] : CSFileTransferErrorDomain;
++    NSError *underlyingError = [NSError errorWithDomain:underlyingDomain
++                                                   code:error->code
++                                               userInfo:@{ NSLocalizedDescriptionKey: description }];
++    return [NSError errorWithDomain:CSFileTransferErrorDomain
++                               code:CSFileTransferErrorFailed
++                           userInfo:@{ NSLocalizedDescriptionKey: description,
++                                       NSUnderlyingErrorKey: underlyingError }];
++}
++
++- (instancetype)initWithURLs:(NSArray<NSURL *> *)urls
++              progressHandler:(CSFileTransferProgressHandler)progressHandler
++           completionHandler:(CSFileTransferCompletionHandler)completionHandler
++              cleanupHandler:(CSFileTransferCleanupHandler)cleanupHandler {
++    self = [super init];
++    if (self) {
++        self.urls = [urls copy];
++        self.progressHandler = progressHandler;
++        self.completionHandler = completionHandler;
++        self.cleanupHandler = cleanupHandler;
++    }
++    return self;
++}
++
++- (BOOL)isCancelled {
++    @synchronized (self) {
++        return _cancelled;
++    }
++}
++
++- (BOOL)isFinished {
++    @synchronized (self) {
++        return _finished;
++    }
++}
++
++- (void)cancel {
++    GCancellable *cancellable = NULL;
++    @synchronized (self) {
++        if (_finished) {
++            return;
++        }
++        _cancelled = YES;
++        if (_cancellable) {
++            cancellable = g_object_ref(_cancellable);
++        }
++    }
++    if (cancellable) {
++        g_cancellable_cancel(cancellable);
++        g_object_unref(cancellable);
++    }
++}
++
++- (void)dispatchProgressCompleted:(uint64_t)completed total:(uint64_t)total {
++    @synchronized (self) {
++        if (_finished || !self.progressHandler) {
++            return;
++        }
++        _latestCompleted = completed;
++        _latestTotal = total;
++        if (_progressDispatchPending) {
++            return;
++        }
++        _progressDispatchPending = YES;
++    }
++
++    dispatch_async(dispatch_get_main_queue(), ^{
++        CSFileTransferProgressHandler progressHandler;
++        uint64_t latestCompleted;
++        uint64_t latestTotal;
++        @synchronized (self) {
++            self->_progressDispatchPending = NO;
++            progressHandler = self.progressHandler;
++            latestCompleted = self->_latestCompleted;
++            latestTotal = self->_latestTotal;
++        }
++        if (progressHandler) {
++            progressHandler(latestCompleted, latestTotal);
++        }
++    });
++}
++
++- (void)finishOnWorkerWithError:(nullable NSError *)error {
++    SpiceMainChannel *mainChannel = NULL;
++    GCancellable *cancellable = NULL;
++    @synchronized (self) {
++        if (_finished) {
++            return;
++        }
++        _finished = YES;
++        mainChannel = _mainChannel;
++        _mainChannel = NULL;
++        cancellable = _cancellable;
++        _cancellable = NULL;
++    }
++
++    if (cancellable) {
++        g_object_unref(cancellable);
++    }
++    if (mainChannel) {
++        g_object_unref(mainChannel);
++    }
++
++    dispatch_async(dispatch_get_main_queue(), ^{
++        CSFileTransferCleanupHandler cleanupHandler = self.cleanupHandler;
++        CSFileTransferCompletionHandler completionHandler = self.completionHandler;
++        self.cleanupHandler = nil;
++        self.completionHandler = nil;
++        self.progressHandler = nil;
++        cleanupHandler(self);
++        completionHandler(error);
++    });
++}
++
++static void cs_file_transfer_progress(goffset currentNumBytes,
++                                      goffset totalNumBytes,
++                                      gpointer userData) {
++    CSFileTransfer *self = (__bridge CSFileTransfer *)userData;
++    [self dispatchProgressCompleted:(uint64_t)MAX(currentNumBytes, 0)
++                              total:(uint64_t)MAX(totalNumBytes, 0)];
++}
++
++static void cs_file_transfer_complete(GObject *sourceObject,
++                                      GAsyncResult *result,
++                                      gpointer userData) {
++    CSFileTransfer *self = (__bridge_transfer CSFileTransfer *)userData;
++    GError *error = NULL;
++    gboolean success = spice_main_channel_file_copy_finish(SPICE_MAIN_CHANNEL(sourceObject),
++                                                            result,
++                                                            &error);
++    NSError *nsError = nil;
++    if (!success) {
++        if (self.isCancelled) {
++            nsError = cs_file_transfer_error(CSFileTransferErrorCancelled,
++                                              NSLocalizedString(@"The file transfer was cancelled.", @"CSFileTransfer"));
++        } else if (error) {
++            nsError = cs_file_transfer_error_from_gerror(error);
++        } else {
++            nsError = cs_file_transfer_error(CSFileTransferErrorFailed,
++                                              NSLocalizedString(@"The file transfer failed.", @"CSFileTransfer"));
++        }
++    }
++    g_clear_error(&error);
++    [self finishOnWorkerWithError:nsError];
++}
++
++- (void)startWithMainChannel:(SpiceMainChannel *)mainChannel {
++    NSParameterAssert(!mainChannel || SPICE_IS_MAIN_CHANNEL(mainChannel));
++
++    if (self.isCancelled) {
++        [self finishOnWorkerWithError:cs_file_transfer_error(CSFileTransferErrorCancelled,
++                                                              NSLocalizedString(@"The file transfer was cancelled.", @"CSFileTransfer"))];
++        return;
++    }
++    if (!mainChannel) {
++        [self finishOnWorkerWithError:cs_file_transfer_error(CSFileTransferErrorNotConnected,
++                                                              NSLocalizedString(@"The SPICE connection is not available.", @"CSFileTransfer"))];
++        return;
++    }
++
++    gboolean agentConnected = FALSE;
++    g_object_get(mainChannel, "agent-connected", &agentConnected, NULL);
++    if (!agentConnected) {
++        [self finishOnWorkerWithError:cs_file_transfer_error(CSFileTransferErrorAgentUnavailable,
++                                                              NSLocalizedString(@"The SPICE guest agent is not connected.", @"CSFileTransfer"))];
++        return;
++    }
++    if (spice_main_channel_agent_test_capability(mainChannel, VD_AGENT_CAP_FILE_XFER_DISABLED)) {
++        [self finishOnWorkerWithError:cs_file_transfer_error(CSFileTransferErrorUnsupported,
++                                                              NSLocalizedString(@"File transfer is disabled by the SPICE guest agent.", @"CSFileTransfer"))];
++        return;
++    }
++
++    GFile **files = g_new0(GFile *, self.urls.count + 1);
++    for (NSUInteger index = 0; index < self.urls.count; index++) {
++        files[index] = g_file_new_for_path(self.urls[index].fileSystemRepresentation);
++    }
++
++    @synchronized (self) {
++        if (_cancelled) {
++            for (NSUInteger index = 0; index < self.urls.count; index++) {
++                g_object_unref(files[index]);
++            }
++            g_free(files);
++            [self finishOnWorkerWithError:cs_file_transfer_error(CSFileTransferErrorCancelled,
++                                                                  NSLocalizedString(@"The file transfer was cancelled.", @"CSFileTransfer"))];
++            return;
++        }
++
++        _mainChannel = g_object_ref(mainChannel);
++        _cancellable = g_cancellable_new();
++
++        // spice-gtk creates and retains every per-file task synchronously in
++        // this call. Keep cancellation serialized until that has happened so
++        // an already-cancelled GCancellable cannot produce an empty operation
++        // which would have no task available to deliver completion.
++        spice_main_channel_file_copy_async(mainChannel,
++                                           files,
++                                           G_FILE_COPY_NONE,
++                                           _cancellable,
++                                           cs_file_transfer_progress,
++                                           (__bridge gpointer)self,
++                                           cs_file_transfer_complete,
++                                           (__bridge_retained gpointer)self);
++    }
++
++    for (NSUInteger index = 0; index < self.urls.count; index++) {
++        g_object_unref(files[index]);
++    }
++    g_free(files);
++}
++
++@end
+diff --git a/Sources/CocoaSpice/include/CSFileTransfer.h b/Sources/CocoaSpice/include/CSFileTransfer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3709b9b980df5e032336747b6bbb1bb6b2252654
+--- /dev/null
++++ b/Sources/CocoaSpice/include/CSFileTransfer.h
+@@ -0,0 +1,53 @@
++//
++// Copyright © 2026 osy. All rights reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++//
++
++#import <Foundation/Foundation.h>
++
++NS_ASSUME_NONNULL_BEGIN
++
++FOUNDATION_EXPORT NSErrorDomain const CSFileTransferErrorDomain;
++
++typedef NS_ERROR_ENUM(CSFileTransferErrorDomain, CSFileTransferError) {
++    CSFileTransferErrorInvalidSource = 1,
++    CSFileTransferErrorNotConnected,
++    CSFileTransferErrorAgentUnavailable,
++    CSFileTransferErrorUnsupported,
++    CSFileTransferErrorFailed,
++    CSFileTransferErrorCancelled,
++};
++
++typedef void (^CSFileTransferProgressHandler)(uint64_t completed, uint64_t total);
++typedef void (^CSFileTransferCompletionHandler)(NSError * _Nullable error);
++
++/// Represents one host-to-guest SPICE file transfer operation.
++///
++/// Progress and completion callbacks are always delivered on the main queue.
++@interface CSFileTransfer : NSObject
++
++/// Whether cancellation has been requested.
++@property (nonatomic, readonly, getter=isCancelled) BOOL cancelled;
++
++/// Whether the operation has finished and queued its completion callback.
++@property (nonatomic, readonly, getter=isFinished) BOOL finished;
++
++- (instancetype)init NS_UNAVAILABLE;
++
++/// Request cancellation. This method is safe to call from any thread.
++- (void)cancel;
++
++@end
++
++NS_ASSUME_NONNULL_END

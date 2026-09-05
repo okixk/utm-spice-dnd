@@ -1,0 +1,737 @@
+diff --git a/Configuration/UTMQemuConfiguration+Arguments.swift b/Configuration/UTMQemuConfiguration+Arguments.swift
+index 34342d83779ce749a35736c1ff7c8dff1a63b752..1f776233a70468ecb32be8d1c1d8a4594de3777e 100644
+--- a/Configuration/UTMQemuConfiguration+Arguments.swift
++++ b/Configuration/UTMQemuConfiguration+Arguments.swift
+@@ -1122,6 +1122,14 @@ import Virtualization // for getting network interfaces
+             f("virtserialport,chardev=vdagent,name=com.redhat.spice.0")
+             f("-chardev")
+             f("spicevmc,id=vdagent,debug=0,name=vdagent")
++#if os(macOS)
++            if !isRemoteSpice {
++                f("-device")
++                f("virtserialport,chardev=utmdnd,name=com.utmapp.dnd.0")
++                f("-chardev")
++                f("spiceport,id=utmdnd,name=com.utmapp.dnd.0")
++            }
++#endif
+             if sharing.directoryShareMode == .webdav {
+                 f("-device")
+                 f("virtserialport,chardev=charchannel1,id=channel1,name=org.spice-space.webdav.0")
+diff --git a/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift b/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
+index 2e45795d0cd2925c42ec24c192028e4289c20f3f..f10158d0a4a7c0756a77d2bc7be235de22118577 100644
+--- a/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
++++ b/Platform/macOS/Display/VMDisplayQemuMetalWindowController.swift
+@@ -45,6 +45,7 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+     private var globalEventMonitor: Any? = nil
+     private var ctrlKeyDown: Bool = false
+     private var screenChangedToken: Any?
++    private var isSemanticFileTransferActive = false
+ 
+     private var displayConfig: UTMQemuConfigurationDisplay? {
+         vmQemuConfig?.displays[id]
+@@ -103,6 +104,8 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+         vmDisplay?.addRenderer(renderer) // can be nil if primary
+         metalView.delegate = renderer
+         metalView.inputDelegate = self
++        metalView.fileDropDelegate = self
++        metalView.registerForDraggedTypes([.fileURL])
+ 
+         screenChangedToken = NotificationCenter.default.addObserver(forName: NSWindow.didChangeScreenNotification, object: nil, queue: .main) { [weak self] _ in
+             // update minSize when we change screens
+@@ -122,6 +125,8 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+     }
+     
+     override func windowWillClose(_ notification: Notification) {
++        metalView.unregisterDraggedTypes()
++        metalView.fileDropDelegate = nil
+         vmDisplay?.removeRenderer(renderer!)
+         stopAllCapture()
+         if let screenChangedToken = screenChangedToken {
+@@ -198,6 +203,185 @@ class VMDisplayQemuMetalWindowController: VMDisplayQemuWindowController {
+     }
+ }
+ 
++// MARK: - Host file transfer
++
++private enum VMFileDropError: LocalizedError {
++    case noFiles
++    case unavailable
++    case unsupportedFile(String)
++    case outsideDisplay
++    case transferInProgress
++
++    var errorDescription: String? {
++        switch self {
++        case .noFiles:
++            return NSLocalizedString("No files were selected for transfer.", comment: "VMDisplayQemuMetalWindowController")
++        case .unavailable:
++            return NSLocalizedString("The SPICE connection is not available.", comment: "VMDisplayQemuMetalWindowController")
++        case .unsupportedFile(let name):
++            return String.localizedStringWithFormat(NSLocalizedString("“%@” is not a readable regular file.", comment: "VMDisplayQemuMetalWindowController"), name)
++        case .outsideDisplay:
++            return NSLocalizedString("The file must be dropped inside the guest display.", comment: "VMDisplayQemuMetalWindowController")
++        case .transferInProgress:
++            return NSLocalizedString("Another target-aware file transfer is already in progress.", comment: "VMDisplayQemuMetalWindowController")
++        }
++    }
++}
++
++extension VMDisplayQemuMetalWindowController: VMMetalViewFileDropDelegate {
++    private var isDropDebugEnabled: Bool {
++        ProcessInfo.processInfo.environment["UTM_DND_DEBUG"] == "1"
++    }
++
++    private func validatedFileURLs(_ urls: [URL]) throws -> [URL] {
++        guard !urls.isEmpty else {
++            throw VMFileDropError.noFiles
++        }
++
++        var validatedURLs = [URL]()
++        for url in urls {
++            guard url.isFileURL,
++                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
++                  values.isRegularFile == true,
++                  FileManager.default.isReadableFile(atPath: url.path) else {
++                throw VMFileDropError.unsupportedFile(url.lastPathComponent)
++            }
++            validatedURLs.append(url)
++        }
++        return validatedURLs
++    }
++
++    private func guestDropPoint(from viewPoint: CGPoint, in metalView: VMMetalView) -> CGPoint? {
++        guard let vmDisplay,
++              displaySize.width > 0,
++              displaySize.height > 0,
++              vmDisplay.viewportScale > 0 else {
++            return nil
++        }
++
++        let backingPoint = metalView.convertToBacking(viewPoint)
++        let drawableSize = metalView.drawableSize
++        let renderedSize = CGSize(width: displaySize.width * vmDisplay.viewportScale,
++                                  height: displaySize.height * vmDisplay.viewportScale)
++        let origin = CGPoint(x: (drawableSize.width - renderedSize.width) / 2,
++                             y: (drawableSize.height - renderedSize.height) / 2)
++        let guestX = (backingPoint.x - origin.x) / vmDisplay.viewportScale
++        let guestY = (drawableSize.height - backingPoint.y - origin.y) / vmDisplay.viewportScale
++        guard guestX >= 0,
++              guestY >= 0,
++              guestX < displaySize.width,
++              guestY < displaySize.height else {
++            return nil
++        }
++        return CGPoint(x: guestX, y: guestY)
++    }
++
++    func metalView(_ metalView: VMMetalView, canAcceptFileURLs urls: [URL], at point: CGPoint) -> Bool {
++        guard vm.state == .started,
++              qemuVM.ioService?.isConnected == true,
++              guestDropPoint(from: point, in: metalView) != nil,
++              !isSemanticFileTransferActive else {
++            return false
++        }
++        return (try? validatedFileURLs(urls)) != nil
++    }
++
++    func metalView(_ metalView: VMMetalView, performFileDropWith urls: [URL], at viewPoint: CGPoint) -> Bool {
++        do {
++            let urls = try validatedFileURLs(urls)
++            guard vm.state == .started,
++                  let ioService = qemuVM.ioService,
++                  ioService.isConnected else {
++                throw VMFileDropError.unavailable
++            }
++            guard !isSemanticFileTransferActive else {
++                throw VMFileDropError.transferInProgress
++            }
++            guard let guestPoint = guestDropPoint(from: viewPoint, in: metalView),
++                  let vmDisplay else {
++                throw VMFileDropError.outsideDisplay
++            }
++
++            let files: [[String: Any]] = try urls.map { url in
++                let values = try url.resourceValues(forKeys: [.fileSizeKey])
++                guard let size = values.fileSize else {
++                    throw VMFileDropError.unsupportedFile(url.lastPathComponent)
++                }
++                return ["name": url.lastPathComponent, "size": size]
++            }
++            let transferIdentifier = UUID().uuidString.lowercased()
++            let metadata: [String: Any] = [
++                "type": "drop",
++                "version": 1,
++                "transferId": transferIdentifier,
++                "display": vmDisplay.monitorID,
++                "x": guestPoint.x,
++                "y": guestPoint.y,
++                "framebufferWidth": displaySize.width,
++                "framebufferHeight": displaySize.height,
++                "files": files,
++            ]
++
++            if isDropDebugEnabled {
++                logger.info("UTM drop: view=(\(viewPoint.x), \(viewPoint.y)) guest=(\(guestPoint.x), \(guestPoint.y)) display=\(vmDisplay.monitorID)")
++            }
++
++            let startTransfer: () -> Bool = { [weak self, weak ioService] in
++                guard let self, let ioService else {
++                    return false
++                }
++                self.isSemanticFileTransferActive = true
++                logger.info("Starting SPICE transfer of \(urls.count) host file(s), id=\(transferIdentifier).")
++                let started = ioService.sendFiles(urls, progress: nil) { [weak self, weak ioService] error in
++                    self?.isSemanticFileTransferActive = false
++                    if let error {
++                        ioService?.cancelDropMetadataTransfer(transferIdentifier)
++                        logger.error("SPICE file transfer failed: \(error.localizedDescription)")
++                        self?.showErrorAlert(error.localizedDescription)
++                    } else {
++                        logger.info("SPICE file transfer completed, id=\(transferIdentifier).")
++                    }
++                }
++                if !started {
++                    self.isSemanticFileTransferActive = false
++                }
++                return started
++            }
++
++            if ioService.isDropMetadataAvailable {
++                isSemanticFileTransferActive = true
++                let accepted = ioService.sendDropMetadata(metadata) { [weak self] response, error in
++                    guard let self else {
++                        return
++                    }
++                    self.isSemanticFileTransferActive = false
++                    if let error {
++                        logger.warning("Target-aware guest helper unavailable (\(error.localizedDescription)); using Downloads fallback.")
++                        _ = startTransfer()
++                        return
++                    }
++                    if self.isDropDebugEnabled,
++                       let target = response?["target"] {
++                        logger.info("Guest target: \(String(describing: target))")
++                    }
++                    _ = startTransfer()
++                }
++                if accepted {
++                    return true
++                }
++                isSemanticFileTransferActive = false
++            }
++
++            logger.debug("Target-aware guest helper is unavailable; using Downloads fallback.")
++            return startTransfer()
++        } catch {
++            logger.error("Rejected host file drop: \(error.localizedDescription)")
++            showErrorAlert(error.localizedDescription)
++            return false
++        }
++    }
++}
++
+ // MARK: - SPICE IO
+ extension VMDisplayQemuMetalWindowController {
+     override func spiceDidCreateInput(_ input: CSInput) {
+diff --git a/Platform/macOS/Display/VMMetalView.swift b/Platform/macOS/Display/VMMetalView.swift
+index 74c55d22c69eef586cd0f2c88a2724fa47ebb0ed..9b465fbf391c8a6df50a392b24b394ac91f72113 100644
+--- a/Platform/macOS/Display/VMMetalView.swift
++++ b/Platform/macOS/Display/VMMetalView.swift
+@@ -16,8 +16,14 @@
+ 
+ import Carbon.HIToolbox
+ 
++protocol VMMetalViewFileDropDelegate: AnyObject {
++    func metalView(_ metalView: VMMetalView, canAcceptFileURLs urls: [URL], at point: CGPoint) -> Bool
++    func metalView(_ metalView: VMMetalView, performFileDropWith urls: [URL], at point: CGPoint) -> Bool
++}
++
+ class VMMetalView: MTKView {
+     weak var inputDelegate: VMMetalViewInputDelegate?
++    weak var fileDropDelegate: VMMetalViewFileDropDelegate?
+     private var wholeTrackingArea: NSTrackingArea?
+     private var lastModifiers = NSEvent.ModifierFlags()
+     private var lastKeyDown: Int?
+@@ -28,6 +34,43 @@ class VMMetalView: MTKView {
+     @Setting("IsCtrlCmdSwapped") private var isCtrlCmdSwapped = false
+     @Setting("IsISOKeySwapped") private var isISOKeySwapped = false
+ 
++    private func fileURLs(from draggingInfo: NSDraggingInfo) -> [URL]? {
++        let pasteboard = draggingInfo.draggingPasteboard
++        guard let items = pasteboard.pasteboardItems,
++              !items.isEmpty,
++              items.allSatisfy({ $0.availableType(from: [.fileURL]) != nil }),
++              let urls = pasteboard.readObjects(forClasses: [NSURL.self],
++                                                options: [.urlReadingFileURLsOnly: true]) as? [URL],
++              urls.count == items.count else {
++            return nil
++        }
++        return urls
++    }
++
++    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
++        guard sender.draggingSourceOperationMask.contains(.copy),
++              let urls = fileURLs(from: sender),
++              fileDropDelegate?.metalView(self,
++                                          canAcceptFileURLs: urls,
++                                          at: convert(sender.draggingLocation, from: nil)) == true else {
++            return []
++        }
++        return .copy
++    }
++
++    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
++        draggingEntered(sender)
++    }
++
++    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
++        guard let urls = fileURLs(from: sender) else {
++            return false
++        }
++        return fileDropDelegate?.metalView(self,
++                                           performFileDropWith: urls,
++                                           at: convert(sender.draggingLocation, from: nil)) == true
++    }
++
+     /// On ISO keyboards we have to switch `kVK_ISO_Section` and `kVK_ANSI_Grave`
+     /// from: https://chromium.googlesource.com/chromium/src/+/lkgr/ui/events/keycodes/keyboard_code_conversion_mac.mm
+     private func convertToCurrentLayout(for keycode: Int) -> Int {
+diff --git a/Services/UTMSpiceIO.h b/Services/UTMSpiceIO.h
+index 1e0f9dac873a9750e001231fa361d7f1d8b9cb89..fd688b135fbb6765e0ad3c0d02a325fbe4f55909 100644
+--- a/Services/UTMSpiceIO.h
++++ b/Services/UTMSpiceIO.h
+@@ -36,6 +36,10 @@ typedef NS_OPTIONS(NSUInteger, UTMSpiceIOOptions) {
+     UTMSpiceIOOptionsHasDebugLog          = (1 << 3),
+ };
+ 
++typedef void (^UTMSpiceFileTransferProgressHandler)(uint64_t completed, uint64_t total);
++typedef void (^UTMSpiceFileTransferCompletionHandler)(NSError * _Nullable error);
++typedef void (^UTMSpiceDropMetadataCompletionHandler)(NSDictionary * _Nullable response, NSError * _Nullable error);
++
+ NS_ASSUME_NONNULL_BEGIN
+ 
+ #if defined(WITH_REMOTE)
+@@ -54,6 +58,8 @@ NS_ASSUME_NONNULL_BEGIN
+ #endif
+ @property (nonatomic, weak, nullable) id<UTMSpiceIODelegate> delegate;
+ @property (nonatomic, readonly) BOOL isConnected;
++/// Whether the target-aware guest helper control port is connected.
++@property (nonatomic, readonly) BOOL isDropMetadataAvailable;
+ @property (nonatomic, nullable) LogHandler_t logHandler;
+ 
+ - (instancetype)init NS_UNAVAILABLE;
+@@ -61,6 +67,26 @@ NS_ASSUME_NONNULL_BEGIN
+ - (instancetype)initWithHost:(NSString *)host tlsPort:(NSInteger)tlsPort serverPublicKey:(NSData *)serverPublicKey password:(NSString *)password options:(UTMSpiceIOOptions)options NS_DESIGNATED_INITIALIZER;
+ - (void)changeSharedDirectory:(NSURL *)url;
+ 
++/// Transfer local files to the connected SPICE guest agent.
++///
++/// Security-scoped access to each URL is retained until completion. The
++/// operation is retained internally and cancelled if the SPICE connection is
++/// disconnected.
++- (BOOL)sendFiles:(NSArray<NSURL *> *)urls
++         progress:(nullable UTMSpiceFileTransferProgressHandler)progress
++       completion:(UTMSpiceFileTransferCompletionHandler)completion;
++
++/// Send one versioned semantic drop request to the guest helper.
++///
++/// The dictionary is serialized as one newline-delimited JSON message. The
++/// completion handler receives the matching `ready` or `error` response on the
++/// main queue. This channel never transports file contents.
++- (BOOL)sendDropMetadata:(NSDictionary *)metadata
++              completion:(UTMSpiceDropMetadataCompletionHandler)completion;
++
++/// Disarm an outstanding semantic transfer after its SPICE operation fails.
++- (void)cancelDropMetadataTransfer:(NSString *)transferIdentifier;
++
+ - (BOOL)startWithError:(NSError * _Nullable *)error;
+ - (BOOL)connectWithError:(NSError * _Nullable *)error;
+ - (void)disconnect;
+diff --git a/Services/UTMSpiceIO.m b/Services/UTMSpiceIO.m
+index 0ee166cc65b9ee6f8fffa14dbe72fa97894e71ab..522d5cd307d3d8147f984b263b56b638cba59295 100644
+--- a/Services/UTMSpiceIO.m
++++ b/Services/UTMSpiceIO.m
+@@ -19,8 +19,12 @@
+ #import "UTM-Swift.h"
+ 
+ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
++static NSString *const kUTMDropPortName = @"com.utmapp.dnd.0";
++static const NSInteger kUTMDropProtocolVersion = 1;
++static const NSUInteger kUTMDropMaximumMessageSize = 64 * 1024;
++static const NSTimeInterval kUTMDropResponseTimeout = 3.0;
+ 
+-@interface UTMSpiceIO ()
++@interface UTMSpiceIO () <CSPortDelegate>
+ 
+ @property (nonatomic, nullable) NSURL *socketUrl;
+ @property (nonatomic, nullable) NSString *host;
+@@ -33,6 +37,11 @@ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
+ @property (nonatomic, readwrite, nullable) CSInput *primaryInput;
+ @property (nonatomic, readwrite, nullable) CSPort *primarySerial;
+ @property (nonatomic) NSMutableArray<CSPort *> *mutableSerials;
++@property (nonatomic) NSMutableSet<CSFileTransfer *> *activeFileTransfers;
++@property (nonatomic, nullable) CSPort *dropMetadataPort;
++@property (nonatomic) NSMutableData *dropMetadataBuffer;
++@property (nonatomic) NSMutableDictionary<NSString *, UTMSpiceDropMetadataCompletionHandler> *dropMetadataCompletions;
++@property (nonatomic) BOOL dropMetadataDiscardingOversizedMessage;
+ #if defined(WITH_USB)
+ @property (nonatomic, readwrite, nullable) CSUSBManager *primaryUsbManager;
+ #endif
+@@ -70,6 +79,9 @@ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
+         self.options = options;
+         self.mutableDisplays = [NSMutableArray array];
+         self.mutableSerials = [NSMutableArray array];
++        self.activeFileTransfers = [NSMutableSet set];
++        self.dropMetadataBuffer = [NSMutableData data];
++        self.dropMetadataCompletions = [NSMutableDictionary dictionary];
+     }
+     
+     return self;
+@@ -84,6 +96,9 @@ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
+         self.options = options;
+         self.mutableDisplays = [NSMutableArray array];
+         self.mutableSerials = [NSMutableArray array];
++        self.activeFileTransfers = [NSMutableSet set];
++        self.dropMetadataBuffer = [NSMutableData data];
++        self.dropMetadataCompletions = [NSMutableDictionary dictionary];
+     }
+ 
+     return self;
+@@ -149,6 +164,16 @@ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
+ }
+ 
+ - (void)disconnect {
++    NSArray<CSFileTransfer *> *activeFileTransfers;
++    @synchronized (self.activeFileTransfers) {
++        activeFileTransfers = self.activeFileTransfers.allObjects;
++    }
++    for (CSFileTransfer *transfer in activeFileTransfers) {
++        [transfer cancel];
++    }
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [self clearDropMetadataPortWithDescription:NSLocalizedString(@"The SPICE connection was closed.", @"UTMSpiceIO")];
++    });
+     [self endSharingDirectory];
+     [self.spiceConnection disconnect];
+     self.spiceConnection.delegate = nil;
+@@ -175,6 +200,262 @@ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
+     }
+ }
+ 
++#pragma mark - File Transfer
++
++- (BOOL)isDropMetadataAvailable {
++    NSAssert(NSThread.isMainThread, @"Drop metadata state must be read on the main thread.");
++    return self.dropMetadataPort != nil && self.dropMetadataPort.isOpen;
++}
++
++- (NSError *)dropMetadataErrorWithDescription:(NSString *)description {
++    return [NSError errorWithDomain:kUTMErrorDomain
++                               code:-1
++                           userInfo:@{ NSLocalizedDescriptionKey: description }];
++}
++
++- (void)clearDropMetadataPortWithDescription:(NSString *)description {
++    NSAssert(NSThread.isMainThread, @"Drop metadata state must be changed on the main thread.");
++    self.dropMetadataPort.delegate = nil;
++    self.dropMetadataPort = nil;
++    self.dropMetadataBuffer.length = 0;
++    self.dropMetadataDiscardingOversizedMessage = NO;
++    NSDictionary<NSString *, UTMSpiceDropMetadataCompletionHandler> *completions = self.dropMetadataCompletions.copy;
++    [self.dropMetadataCompletions removeAllObjects];
++    NSError *error = [self dropMetadataErrorWithDescription:description];
++    for (UTMSpiceDropMetadataCompletionHandler completion in completions.allValues) {
++        completion(nil, error);
++    }
++}
++
++- (BOOL)sendDropMetadata:(NSDictionary *)metadata
++              completion:(UTMSpiceDropMetadataCompletionHandler)completion {
++    NSAssert(NSThread.isMainThread, @"Drop metadata must be sent from the main thread.");
++    CSPort *port = self.dropMetadataPort;
++    NSString *transferIdentifier = metadata[@"transferId"];
++    NSUUID *uuid = [transferIdentifier isKindOfClass:NSString.class] ? [[NSUUID alloc] initWithUUIDString:transferIdentifier] : nil;
++    transferIdentifier = uuid.UUIDString.lowercaseString;
++    if (!self.isConnected || !port || !port.isOpen || !transferIdentifier) {
++        return NO;
++    }
++
++    NSError *serializationError = nil;
++    NSData *json = [NSJSONSerialization dataWithJSONObject:metadata options:0 error:&serializationError];
++    if (!json || json.length + 1 > kUTMDropMaximumMessageSize) {
++        UTMLog(@"failed to serialize drag-and-drop metadata: %@", serializationError.localizedDescription);
++        return NO;
++    }
++    if (self.dropMetadataCompletions[transferIdentifier]) {
++        UTMLog(@"duplicate drag-and-drop metadata identifier: %@", transferIdentifier);
++        return NO;
++    }
++
++    NSMutableData *message = [json mutableCopy];
++    const uint8_t newline = '\n';
++    [message appendBytes:&newline length:1];
++    self.dropMetadataCompletions[transferIdentifier] = [completion copy];
++    [port writeData:message];
++    UTMLog(@"drag-and-drop metadata queued: port=%@ id=%@ version=%@ display=%@ guest=(%@,%@) framebuffer=(%@,%@) files=%lu bytes=%lu",
++           port.name, transferIdentifier, metadata[@"version"], metadata[@"display"], metadata[@"x"], metadata[@"y"],
++           metadata[@"framebufferWidth"], metadata[@"framebufferHeight"],
++           (unsigned long)[metadata[@"files"] count], (unsigned long)message.length);
++
++    __weak typeof(self) weakSelf = self;
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kUTMDropResponseTimeout * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++        typeof(self) self = weakSelf;
++        UTMSpiceDropMetadataCompletionHandler pending = self.dropMetadataCompletions[transferIdentifier];
++        if (pending) {
++            [self.dropMetadataCompletions removeObjectForKey:transferIdentifier];
++            UTMLog(@"drag-and-drop metadata timed out: id=%@", transferIdentifier);
++            pending(nil, [self dropMetadataErrorWithDescription:NSLocalizedString(@"The guest drag-and-drop helper did not respond.", @"UTMSpiceIO")]);
++        }
++    });
++    return YES;
++}
++
++- (void)cancelDropMetadataTransfer:(NSString *)transferIdentifier {
++    NSAssert(NSThread.isMainThread, @"Drop metadata must be sent from the main thread.");
++    CSPort *port = self.dropMetadataPort;
++    if (!port || !port.isOpen || transferIdentifier.length == 0) {
++        return;
++    }
++    NSDictionary *payload = @{ @"type": @"cancel", @"version": @(kUTMDropProtocolVersion), @"transferId": transferIdentifier };
++    NSData *json = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
++    if (json) {
++        NSMutableData *message = [json mutableCopy];
++        const uint8_t newline = '\n';
++        [message appendBytes:&newline length:1];
++        [port writeData:message];
++        UTMLog(@"drag-and-drop cancellation queued: id=%@", transferIdentifier);
++    }
++}
++
++- (void)handleDropMetadataDataOnMainQueue:(NSData *)data {
++    NSAssert(NSThread.isMainThread, @"Drop metadata must be parsed on the main thread.");
++    if (self.dropMetadataDiscardingOversizedMessage) {
++        const uint8_t newline = '\n';
++        NSData *delimiter = [NSData dataWithBytes:&newline length:1];
++        NSRange range = [data rangeOfData:delimiter options:0 range:NSMakeRange(0, data.length)];
++        if (range.location == NSNotFound) {
++            return;
++        }
++        self.dropMetadataDiscardingOversizedMessage = NO;
++        data = [data subdataWithRange:NSMakeRange(NSMaxRange(range), data.length - NSMaxRange(range))];
++    }
++    [self.dropMetadataBuffer appendData:data];
++
++    const uint8_t newline = '\n';
++    NSData *delimiter = [NSData dataWithBytes:&newline length:1];
++    while (self.dropMetadataBuffer.length > 0) {
++        NSRange range = [self.dropMetadataBuffer rangeOfData:delimiter
++                                                    options:0
++                                                      range:NSMakeRange(0, self.dropMetadataBuffer.length)];
++        if (range.location == NSNotFound) {
++            break;
++        }
++        NSData *line = [self.dropMetadataBuffer subdataWithRange:NSMakeRange(0, range.location)];
++        [self.dropMetadataBuffer replaceBytesInRange:NSMakeRange(0, NSMaxRange(range)) withBytes:NULL length:0];
++        if (line.length == 0) {
++            continue;
++        }
++        if (line.length + 1 > kUTMDropMaximumMessageSize) {
++            UTMLog(@"rejected oversized response from drag-and-drop guest helper");
++            continue;
++        }
++        NSError *jsonError = nil;
++        NSDictionary *response = [NSJSONSerialization JSONObjectWithData:line options:0 error:&jsonError];
++        if (![response isKindOfClass:NSDictionary.class]) {
++            UTMLog(@"invalid response from drag-and-drop guest helper: %@", jsonError.localizedDescription);
++            continue;
++        }
++        NSNumber *version = response[@"version"];
++        NSString *rawTransferIdentifier = response[@"transferId"];
++        NSString *type = response[@"type"];
++        BOOL versionIsBoolean = [version isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)version) == CFBooleanGetTypeID();
++        NSUUID *uuid = [rawTransferIdentifier isKindOfClass:NSString.class] ? [[NSUUID alloc] initWithUUIDString:rawTransferIdentifier] : nil;
++        NSString *transferIdentifier = uuid.UUIDString.lowercaseString;
++        if (![version isKindOfClass:NSNumber.class] || versionIsBoolean || version.integerValue != kUTMDropProtocolVersion ||
++            ![type isKindOfClass:NSString.class] || !transferIdentifier) {
++            UTMLog(@"rejected malformed drag-and-drop guest helper response");
++            continue;
++        }
++        UTMSpiceDropMetadataCompletionHandler completion = self.dropMetadataCompletions[transferIdentifier];
++        if (completion && ([type isEqualToString:@"ready"] || [type isEqualToString:@"error"])) {
++            if ([type isEqualToString:@"ready"] && ![response[@"target"] isKindOfClass:NSDictionary.class]) {
++                UTMLog(@"rejected ready response without a valid target: id=%@", transferIdentifier);
++                continue;
++            }
++            if ([type isEqualToString:@"error"] && ![response[@"error"] isKindOfClass:NSString.class]) {
++                UTMLog(@"rejected error response without a valid description: id=%@", transferIdentifier);
++                continue;
++            }
++            [self.dropMetadataCompletions removeObjectForKey:transferIdentifier];
++            if ([type isEqualToString:@"ready"]) {
++                UTMLog(@"drag-and-drop guest helper ready: id=%@ target=%@", transferIdentifier, response[@"target"]);
++                completion(response, nil);
++            } else {
++                NSString *description = response[@"error"];
++                UTMLog(@"drag-and-drop guest helper rejected request: id=%@ error=%@", transferIdentifier, description);
++                completion(response, [self dropMetadataErrorWithDescription:description]);
++            }
++        } else if ([type isEqualToString:@"complete"] || [type isEqualToString:@"error"]) {
++            UTMLog(@"drag-and-drop guest helper status: %@", response);
++        } else {
++            UTMLog(@"ignored unexpected drag-and-drop guest helper response: type=%@ id=%@", type, transferIdentifier);
++        }
++    }
++    if (self.dropMetadataBuffer.length >= kUTMDropMaximumMessageSize) {
++        UTMLog(@"discarding oversized unterminated response from drag-and-drop guest helper");
++        self.dropMetadataBuffer.length = 0;
++        self.dropMetadataDiscardingOversizedMessage = YES;
++    }
++}
++
++- (BOOL)sendFiles:(NSArray<NSURL *> *)urls
++         progress:(UTMSpiceFileTransferProgressHandler)progress
++       completion:(UTMSpiceFileTransferCompletionHandler)completion {
++    CSConnection *connection = self.spiceConnection;
++    if (!self.isConnected || !connection) {
++        NSError *error = [NSError errorWithDomain:kUTMErrorDomain
++                                             code:-1
++                                         userInfo:@{ NSLocalizedDescriptionKey: NSLocalizedString(@"The SPICE connection is not available.", @"UTMSpiceIO") }];
++        dispatch_async(dispatch_get_main_queue(), ^{
++            completion(error);
++        });
++        return NO;
++    }
++
++    NSMutableArray<NSURL *> *scopedURLs = [NSMutableArray array];
++    NSError *validationError = nil;
++    for (NSURL *url in urls) {
++        if (url.isFileURL && [url startAccessingSecurityScopedResource]) {
++            [scopedURLs addObject:url];
++        }
++
++        NSNumber *isRegularFile = nil;
++        NSError *resourceError = nil;
++        BOOL hasResourceValue = url.isFileURL &&
++            [url getResourceValue:&isRegularFile forKey:NSURLIsRegularFileKey error:&resourceError];
++        if (!hasResourceValue || !isRegularFile.boolValue ||
++            ![NSFileManager.defaultManager isReadableFileAtPath:url.path]) {
++            NSString *description = [NSString stringWithFormat:NSLocalizedString(@"“%@” is not a readable regular file.", @"UTMSpiceIO"), url.lastPathComponent];
++            NSMutableDictionary *userInfo = [@{ NSLocalizedDescriptionKey: description } mutableCopy];
++            if (resourceError) {
++                userInfo[NSUnderlyingErrorKey] = resourceError;
++            }
++            validationError = [NSError errorWithDomain:kUTMErrorDomain
++                                                   code:-1
++                                               userInfo:userInfo];
++            break;
++        }
++    }
++
++    if (urls.count == 0 && !validationError) {
++        validationError = [NSError errorWithDomain:kUTMErrorDomain
++                                               code:-1
++                                           userInfo:@{ NSLocalizedDescriptionKey: NSLocalizedString(@"No files were selected for transfer.", @"UTMSpiceIO") }];
++    }
++
++    if (validationError) {
++        for (NSURL *url in scopedURLs) {
++            [url stopAccessingSecurityScopedResource];
++        }
++        dispatch_async(dispatch_get_main_queue(), ^{
++            completion(validationError);
++        });
++        return NO;
++    }
++
++    UTMLog(@"starting SPICE file transfer for %lu file(s)", (unsigned long)urls.count);
++    __weak typeof(self) weakSelf = self;
++    __block __weak CSFileTransfer *weakTransfer = nil;
++    CSFileTransfer *transfer = [connection transferFiles:urls
++                                                progress:progress
++                                              completion:^(NSError *error) {
++        for (NSURL *url in scopedURLs) {
++            [url stopAccessingSecurityScopedResource];
++        }
++        typeof(self) self = weakSelf;
++        if (self) {
++            @synchronized (self.activeFileTransfers) {
++                [self.activeFileTransfers removeObject:weakTransfer];
++            }
++        }
++        if (error) {
++            UTMLog(@"SPICE file transfer failed: %@", error.localizedDescription);
++        } else {
++            UTMLog(@"SPICE file transfer completed");
++        }
++        completion(error);
++    }];
++    weakTransfer = transfer;
++    if (transfer) {
++        @synchronized (self.activeFileTransfers) {
++            [self.activeFileTransfers addObject:transfer];
++        }
++    }
++    return transfer != nil;
++}
++
+ #pragma mark - CSConnectionDelegate
+ 
+ - (void)spiceConnected:(CSConnection *)connection {
+@@ -280,6 +561,14 @@ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
+             [self.connectDelegate qemuInterface:self didCreateGuestAgentPort:qemuPort];
+ #endif
+         }
++        if ([port.name isEqualToString:kUTMDropPortName]) {
++            if (self.dropMetadataPort && self.dropMetadataPort != port) {
++                [self clearDropMetadataPortWithDescription:NSLocalizedString(@"The drag-and-drop guest helper port reconnected.", @"UTMSpiceIO")];
++            }
++            self.dropMetadataPort = port;
++            self.dropMetadataPort.delegate = self;
++            UTMLog(@"drag-and-drop guest helper port opened: name=%@ open=%d", port.name, port.isOpen);
++        }
+         if ([port.name isEqualToString:@"com.utmapp.terminal.0"]) {
+             self.primarySerial = port;
+         }
+@@ -296,6 +585,9 @@ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
+         }
+         if ([port.name isEqualToString:@"org.qemu.guest_agent.0"]) {
+         }
++        if (port == self.dropMetadataPort) {
++            [self clearDropMetadataPortWithDescription:NSLocalizedString(@"The guest drag-and-drop helper disconnected.", @"UTMSpiceIO")];
++        }
+         if ([port.name hasPrefix:@"com.utmapp.terminal."]) {
+             [self.mutableSerials removeObject:port];
+             if (self.primarySerial == port) {
+@@ -306,6 +598,32 @@ NSString *const kUTMErrorDomain = @"com.utmapp.utm";
+     });
+ }
+ 
++#pragma mark - CSPortDelegate
++
++- (void)portDidDisconect:(CSPort *)port {
++    dispatch_async(dispatch_get_main_queue(), ^{
++        if (port == self.dropMetadataPort) {
++            [self clearDropMetadataPortWithDescription:NSLocalizedString(@"The guest drag-and-drop helper disconnected.", @"UTMSpiceIO")];
++        }
++    });
++}
++
++- (void)port:(CSPort *)port didError:(NSString *)error {
++    dispatch_async(dispatch_get_main_queue(), ^{
++        if (port == self.dropMetadataPort) {
++            [self clearDropMetadataPortWithDescription:error];
++        }
++    });
++}
++
++- (void)port:(CSPort *)port didRecieveData:(NSData *)data {
++    dispatch_async(dispatch_get_main_queue(), ^{
++        if (port == self.dropMetadataPort) {
++            [self handleDropMetadataDataOnMainQueue:data];
++        }
++    });
++}
++
+ #pragma mark - Shared Directory
+ 
+ - (void)changeSharedDirectory:(NSURL *)url {
