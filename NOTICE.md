@@ -24,6 +24,8 @@ The CocoaSpice patch preserves upstream file headers. It adds a generic `CSFileT
 
 The implementation calls existing spice-gtk file-transfer and port APIs. The spice-gtk upstream project is available at <https://gitlab.freedesktop.org/spice/spice-gtk> and provides its `COPYING` file under the GNU Lesser General Public License, version 2.1. This repository does not redistribute spice-gtk; users building UTM must continue to observe all upstream and transitive dependency licenses.
 
-## Guest prototype licensing
+## Project-authored material
 
-The newly written guest helper, GNOME Shell extension, scripts, and tests did not contain an explicit standalone license decision in the source provided for packaging. No new license has been silently invented here. Their reuse and licensing should be resolved before treating this prototype as a distributable Guest Tools package.
+The newly authored guest helper, GNOME Shell extension, installation scripts, tests, and documentation in this standalone repository are licensed under the GNU Affero General Public License, version 3.0 only. The complete license text is in [LICENSE](LICENSE).
+
+This project license does not relicense the upstream UTM or CocoaSpice source represented by the patches, nor spice-gtk or other dependencies. Those components retain their respective upstream licenses above.

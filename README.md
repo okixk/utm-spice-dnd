@@ -162,4 +162,4 @@ This project is a focused prototype intended to support discussion with UTM and 
 
 ## License and attribution
 
-See [NOTICE.md](NOTICE.md). UTM and CocoaSpice retain their upstream Apache 2.0 licensing and copyright headers inside the patches. The newly written guest prototype had no explicit standalone license decision in the source from which it was packaged; that is called out explicitly in the notice.
+The newly authored guest tooling, scripts, tests, and documentation in this repository are licensed under the GNU Affero General Public License, version 3.0 only. See [LICENSE](LICENSE). UTM and CocoaSpice retain their upstream Apache 2.0 licensing and copyright headers inside the patches; spice-gtk remains LGPL 2.1. See [NOTICE.md](NOTICE.md) for the component-by-component attribution.
