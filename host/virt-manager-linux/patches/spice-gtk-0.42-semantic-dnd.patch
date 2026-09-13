@@ -1,0 +1,1764 @@
+diff -ruN a/src/meson.build b/src/meson.build
+--- a/src/meson.build	2023-01-23 11:04:11.000000000 +0100
++++ b/src/meson.build	2026-09-11 07:46:18.134886549 +0200
+@@ -287,6 +287,8 @@
+     'spice-grabsequence.h',
+     'spice-grabsequence-priv.h',
+     'spice-gtk-session-priv.h',
++    'semantic-dnd.c',
++    'semantic-dnd.h',
+     'spice-util.c',
+     'spice-util-priv.h',
+     'spice-widget-cairo.c',
+diff -ruN a/src/semantic-dnd.c b/src/semantic-dnd.c
+--- a/src/semantic-dnd.c	1970-01-01 01:00:00.000000000 +0100
++++ b/src/semantic-dnd.c	2026-09-11 07:46:18.135567599 +0200
+@@ -0,0 +1,414 @@
++#include "config.h"
++
++#include <math.h>
++#include <string.h>
++#include <json-glib/json-glib.h>
++
++#include "semantic-dnd.h"
++
++#define SEMANTIC_DND_PROTOCOL_VERSION 1
++
++typedef struct {
++    GHashTable *members;
++    gboolean duplicate;
++} MemberValidation;
++
++static void member_seen(JsonParser *parser G_GNUC_UNUSED,
++                        JsonObject *object, const gchar *member,
++                        gpointer user_data)
++{
++    MemberValidation *validation = user_data;
++    gchar *key = g_strdup_printf("%p:%s", (void *)object, member);
++
++    if (g_hash_table_contains(validation->members, key))
++        validation->duplicate = TRUE;
++    g_hash_table_add(validation->members, key);
++}
++
++static gboolean depth_valid(const gchar *line, gsize length)
++{
++    guint depth = 0;
++    gboolean string = FALSE;
++    gboolean escaped = FALSE;
++    gsize i;
++
++    for (i = 0; i < length; i++) {
++        if (string) {
++            if (escaped)
++                escaped = FALSE;
++            else if (line[i] == '\\')
++                escaped = TRUE;
++            else if (line[i] == '"')
++                string = FALSE;
++        } else if (line[i] == '"') {
++            string = TRUE;
++        } else if (line[i] == '{' || line[i] == '[') {
++            if (++depth > 32)
++                return FALSE;
++        } else if (line[i] == '}' || line[i] == ']') {
++            if (depth == 0)
++                return FALSE;
++            depth--;
++        }
++    }
++    return !string && depth == 0;
++}
++
++static gboolean exact_members(JsonObject *object,
++                              const gchar *const *members,
++                              guint n_members)
++{
++    guint i;
++
++    if (json_object_get_size(object) != n_members)
++        return FALSE;
++    for (i = 0; i < n_members; i++) {
++        if (!json_object_has_member(object, members[i]))
++            return FALSE;
++    }
++    return TRUE;
++}
++
++static gboolean string_member(JsonObject *object,
++                              const gchar *name,
++                              const gchar **value)
++{
++    JsonNode *node = json_object_get_member(object, name);
++
++    if (node == NULL || !JSON_NODE_HOLDS_VALUE(node) ||
++        json_node_get_value_type(node) != G_TYPE_STRING)
++        return FALSE;
++    *value = json_node_get_string(node);
++    return *value != NULL;
++}
++
++static gboolean version_valid(JsonObject *object)
++{
++    JsonNode *node = json_object_get_member(object, "version");
++    GType type;
++
++    if (node == NULL || !JSON_NODE_HOLDS_VALUE(node))
++        return FALSE;
++    type = json_node_get_value_type(node);
++    if (type != G_TYPE_INT64 && type != G_TYPE_INT && type != G_TYPE_LONG)
++        return FALSE;
++    return json_node_get_int(node) == SEMANTIC_DND_PROTOCOL_VERSION;
++}
++
++static gboolean target_valid(JsonNode *node)
++{
++    static const gchar *const allowed[] = {
++        "kind", "uri", "confidence", "reason", "diagnostic"
++    };
++    JsonObject *target;
++    GList *members;
++    GList *item;
++    const gchar *kind;
++    const gchar *uri;
++    const gchar *confidence;
++    const gchar *reason;
++    guint i;
++    gboolean known;
++
++    if (node == NULL || !JSON_NODE_HOLDS_OBJECT(node))
++        return FALSE;
++    target = json_node_get_object(node);
++    if (json_object_get_size(target) < 3 || json_object_get_size(target) > 5 ||
++        !string_member(target, "kind", &kind) ||
++        !string_member(target, "uri", &uri) ||
++        !string_member(target, "confidence", &confidence) ||
++        (!g_str_equal(kind, "desktop") &&
++         !g_str_equal(kind, "nautilus") &&
++         !g_str_equal(kind, "fallback")) ||
++        !g_str_has_prefix(uri, "file://") || strlen(uri) > 4096 ||
++        (!g_str_equal(confidence, "high") &&
++         !g_str_equal(confidence, "low")))
++        return FALSE;
++
++    if (json_object_has_member(target, "reason") &&
++        (!string_member(target, "reason", &reason) || strlen(reason) > 4096))
++        return FALSE;
++    if (json_object_has_member(target, "diagnostic")) {
++        JsonNode *diagnostic = json_object_get_member(target, "diagnostic");
++
++        if (diagnostic == NULL || !JSON_NODE_HOLDS_OBJECT(diagnostic))
++            return FALSE;
++    }
++
++    members = json_object_get_members(target);
++    for (item = members; item != NULL; item = item->next) {
++        known = FALSE;
++        for (i = 0; i < G_N_ELEMENTS(allowed); i++) {
++            if (g_str_equal(item->data, allowed[i])) {
++                known = TRUE;
++                break;
++            }
++        }
++        if (!known) {
++            g_list_free(members);
++            return FALSE;
++        }
++    }
++    g_list_free(members);
++    return TRUE;
++}
++
++SemanticReply semantic_dnd_validate_reply(const gchar *line,
++                                          gsize line_length,
++                                          const gchar *transfer_id)
++{
++    static const gchar *const ready_members[] = {
++        "type", "version", "transferId", "target"
++    };
++    static const gchar *const error_members[] = {
++        "type", "version", "transferId", "error"
++    };
++    static const gchar *const cancelled_members[] = {
++        "type", "version", "transferId"
++    };
++    static const gchar *const complete_members[] = {
++        "type", "version", "transferId"
++    };
++    JsonParser *parser = json_parser_new();
++    JsonNode *root;
++    JsonObject *object;
++    const gchar *type;
++    const gchar *response_id;
++    const gchar *error_message;
++    SemanticReply reply = SEMANTIC_REPLY_INVALID;
++    MemberValidation validation = {
++        g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL), FALSE
++    };
++
++    g_signal_connect(parser, "object-member", G_CALLBACK(member_seen), &validation);
++
++    if (line == NULL || transfer_id == NULL || line_length >= 65536 ||
++        memchr(line, '\0', line_length) != NULL ||
++        !g_utf8_validate(line, line_length, NULL) || !depth_valid(line, line_length) ||
++        g_strstr_len(line, line_length, "\\u0000") != NULL ||
++        !json_parser_load_from_data(parser, line, line_length, NULL) ||
++        validation.duplicate)
++        goto end;
++    root = json_parser_get_root(parser);
++    if (root == NULL || !JSON_NODE_HOLDS_OBJECT(root))
++        goto end;
++    object = json_node_get_object(root);
++    if (!string_member(object, "type", &type) ||
++        !string_member(object, "transferId", &response_id))
++        goto end;
++    if (!g_str_equal(response_id, transfer_id)) {
++        reply = SEMANTIC_REPLY_UNRELATED;
++        goto end;
++    }
++    if (!version_valid(object))
++        goto end;
++
++    if (g_str_equal(type, "ready") &&
++        exact_members(object, ready_members, G_N_ELEMENTS(ready_members)) &&
++        target_valid(json_object_get_member(object, "target"))) {
++        reply = SEMANTIC_REPLY_READY;
++    } else if (g_str_equal(type, "error") &&
++               exact_members(object, error_members, G_N_ELEMENTS(error_members)) &&
++               string_member(object, "error", &error_message) &&
++               error_message[0] != '\0' && strlen(error_message) <= 4096) {
++        reply = SEMANTIC_REPLY_ERROR;
++    } else if (g_str_equal(type, "cancelled") &&
++               exact_members(object, cancelled_members,
++                             G_N_ELEMENTS(cancelled_members))) {
++        reply = SEMANTIC_REPLY_CANCELLED;
++    } else if (g_str_equal(type, "complete") &&
++               exact_members(object, complete_members,
++                             G_N_ELEMENTS(complete_members))) {
++        reply = SEMANTIC_REPLY_COMPLETE;
++    }
++
++end:
++    g_hash_table_unref(validation.members);
++    g_object_unref(parser);
++    return reply;
++}
++
++void semantic_dnd_protocol_init(SemanticDndProtocolState *state,
++                                gboolean semantic)
++{
++    g_return_if_fail(state != NULL);
++
++    *state = (SemanticDndProtocolState) {
++        .phase = semantic ? SEMANTIC_DND_PHASE_WAITING_READY
++                          : SEMANTIC_DND_PHASE_TRANSFERRING,
++        .semantic = semantic,
++    };
++}
++
++SemanticDndProtocolAction semantic_dnd_protocol_ready(
++    SemanticDndProtocolState *state)
++{
++    g_return_val_if_fail(state != NULL, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++
++    if (!state->semantic || state->phase != SEMANTIC_DND_PHASE_WAITING_READY)
++        return SEMANTIC_DND_ACTION_FAIL_CLOSED;
++    state->phase = SEMANTIC_DND_PHASE_TRANSFERRING;
++    return SEMANTIC_DND_ACTION_START_PAYLOAD;
++}
++
++SemanticDndProtocolAction semantic_dnd_protocol_begin_cancel(
++    SemanticDndProtocolState *state, gboolean discard_after_cancel)
++{
++    g_return_val_if_fail(state != NULL, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++
++    if (!state->semantic ||
++        (state->phase != SEMANTIC_DND_PHASE_WAITING_READY &&
++         state->phase != SEMANTIC_DND_PHASE_TRANSFERRING)) {
++        state->phase = SEMANTIC_DND_PHASE_FAILED;
++        return SEMANTIC_DND_ACTION_FAIL_CLOSED;
++    }
++    state->phase = SEMANTIC_DND_PHASE_WAITING_CANCEL;
++    state->discard_after_cancel = discard_after_cancel;
++    state->cancel_write_complete = FALSE;
++    state->cancel_acknowledged = FALSE;
++    return SEMANTIC_DND_ACTION_SEND_CANCEL;
++}
++
++static SemanticDndProtocolAction cancel_barrier_action(
++    SemanticDndProtocolState *state)
++{
++    if (!state->cancel_write_complete || !state->cancel_acknowledged)
++        return SEMANTIC_DND_ACTION_NONE;
++    if (state->discard_after_cancel) {
++        state->phase = SEMANTIC_DND_PHASE_DONE;
++        return SEMANTIC_DND_ACTION_FINISH;
++    }
++    state->semantic = FALSE;
++    state->phase = SEMANTIC_DND_PHASE_TRANSFERRING;
++    return SEMANTIC_DND_ACTION_START_PAYLOAD;
++}
++
++SemanticDndProtocolAction semantic_dnd_protocol_cancel_write(
++    SemanticDndProtocolState *state, gboolean success)
++{
++    g_return_val_if_fail(state != NULL, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++
++    if (state->phase != SEMANTIC_DND_PHASE_WAITING_CANCEL)
++        return SEMANTIC_DND_ACTION_NONE;
++    if (!success) {
++        state->phase = SEMANTIC_DND_PHASE_FAILED;
++        return SEMANTIC_DND_ACTION_FAIL_CLOSED;
++    }
++    state->cancel_write_complete = TRUE;
++    return cancel_barrier_action(state);
++}
++
++SemanticDndProtocolAction semantic_dnd_protocol_cancel_ack(
++    SemanticDndProtocolState *state)
++{
++    g_return_val_if_fail(state != NULL, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++
++    /* Remember an early ACK, but release only after the write callback. */
++    if (state->phase != SEMANTIC_DND_PHASE_WAITING_CANCEL)
++        return SEMANTIC_DND_ACTION_NONE;
++    state->cancel_acknowledged = TRUE;
++    return cancel_barrier_action(state);
++}
++
++SemanticDndProtocolAction semantic_dnd_protocol_payload_finished(
++    SemanticDndProtocolState *state, gboolean success)
++{
++    g_return_val_if_fail(state != NULL, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++
++    if (state->phase != SEMANTIC_DND_PHASE_TRANSFERRING) {
++        state->phase = SEMANTIC_DND_PHASE_FAILED;
++        return SEMANTIC_DND_ACTION_FAIL_CLOSED;
++    }
++    if (!success) {
++        if (state->semantic)
++            return semantic_dnd_protocol_begin_cancel(state, TRUE);
++        state->phase = SEMANTIC_DND_PHASE_DONE;
++        return SEMANTIC_DND_ACTION_FINISH;
++    }
++    if (state->semantic) {
++        state->payload_complete = TRUE;
++        if (!state->complete_acknowledged) {
++            state->phase = SEMANTIC_DND_PHASE_WAITING_COMPLETE;
++            return SEMANTIC_DND_ACTION_NONE;
++        }
++        state->phase = SEMANTIC_DND_PHASE_DONE;
++        return SEMANTIC_DND_ACTION_FINISH;
++    }
++    state->phase = SEMANTIC_DND_PHASE_DONE;
++    return SEMANTIC_DND_ACTION_FINISH;
++}
++
++SemanticDndProtocolAction semantic_dnd_protocol_complete(
++    SemanticDndProtocolState *state, SemanticReply reply)
++{
++    g_return_val_if_fail(state != NULL, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++
++    if (state->phase != SEMANTIC_DND_PHASE_TRANSFERRING &&
++        state->phase != SEMANTIC_DND_PHASE_WAITING_COMPLETE)
++        return SEMANTIC_DND_ACTION_NONE;
++    if (reply == SEMANTIC_REPLY_UNRELATED)
++        return SEMANTIC_DND_ACTION_NONE;
++    if (reply == SEMANTIC_REPLY_COMPLETE) {
++        state->complete_acknowledged = TRUE;
++        if (state->payload_complete) {
++            state->phase = SEMANTIC_DND_PHASE_DONE;
++            return SEMANTIC_DND_ACTION_FINISH;
++        }
++        return SEMANTIC_DND_ACTION_NONE;
++    }
++    state->phase = SEMANTIC_DND_PHASE_FAILED;
++    return SEMANTIC_DND_ACTION_FAIL_CLOSED;
++}
++
++SemanticDndProtocolAction semantic_dnd_protocol_timeout(
++    SemanticDndProtocolState *state)
++{
++    g_return_val_if_fail(state != NULL, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++
++    if (state->phase == SEMANTIC_DND_PHASE_WAITING_READY)
++        return semantic_dnd_protocol_begin_cancel(state, FALSE);
++    state->phase = SEMANTIC_DND_PHASE_FAILED;
++    return SEMANTIC_DND_ACTION_FAIL_CLOSED;
++}
++
++SemanticDndProtocolAction semantic_dnd_protocol_disconnect(
++    SemanticDndProtocolState *state)
++{
++    g_return_val_if_fail(state != NULL, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++
++    if (!state->semantic || state->phase == SEMANTIC_DND_PHASE_DONE)
++        return SEMANTIC_DND_ACTION_NONE;
++    state->phase = SEMANTIC_DND_PHASE_FAILED;
++    return SEMANTIC_DND_ACTION_FAIL_CLOSED;
++}
++
++gboolean semantic_dnd_transform_input(gint framebuffer_width,
++                                      gint framebuffer_height,
++                                      gint display_x,
++                                      gint display_y,
++                                      gint display_width,
++                                      gint display_height,
++                                      gint scale_factor,
++                                      gdouble window_x,
++                                      gdouble window_y,
++                                      gint *input_x,
++                                      gint *input_y)
++{
++    gdouble input_scale;
++
++    if (framebuffer_width <= 0 || framebuffer_height <= 0 ||
++        display_width <= 0 || display_height <= 0 || scale_factor <= 0 ||
++        input_x == NULL || input_y == NULL)
++        return FALSE;
++
++    window_x -= display_x / scale_factor;
++    window_y -= display_y / scale_factor;
++    if (framebuffer_width == 1 || display_width == 1)
++        input_scale = 0.0;
++    else
++        input_scale = ((gdouble)(framebuffer_width - 1) /
++                       (gdouble)(display_width - 1)) * scale_factor;
++    *input_x = floor(window_x * input_scale);
++    *input_y = floor(window_y * input_scale);
++    return TRUE;
++}
+diff -ruN a/src/semantic-dnd.h b/src/semantic-dnd.h
+--- a/src/semantic-dnd.h	1970-01-01 01:00:00.000000000 +0100
++++ b/src/semantic-dnd.h	2026-09-11 07:46:18.136247134 +0200
+@@ -0,0 +1,74 @@
++#pragma once
++
++#include <glib.h>
++
++typedef enum {
++    SEMANTIC_REPLY_INVALID,
++    SEMANTIC_REPLY_UNRELATED,
++    SEMANTIC_REPLY_READY,
++    SEMANTIC_REPLY_ERROR,
++    SEMANTIC_REPLY_CANCELLED,
++    SEMANTIC_REPLY_COMPLETE,
++} SemanticReply;
++
++typedef enum {
++    SEMANTIC_DND_PHASE_WAITING_READY,
++    SEMANTIC_DND_PHASE_WAITING_CANCEL,
++    SEMANTIC_DND_PHASE_TRANSFERRING,
++    SEMANTIC_DND_PHASE_WAITING_COMPLETE,
++    SEMANTIC_DND_PHASE_DONE,
++    SEMANTIC_DND_PHASE_FAILED,
++} SemanticDndProtocolPhase;
++
++typedef enum {
++    SEMANTIC_DND_ACTION_NONE,
++    SEMANTIC_DND_ACTION_SEND_CANCEL,
++    SEMANTIC_DND_ACTION_START_PAYLOAD,
++    SEMANTIC_DND_ACTION_FINISH,
++    SEMANTIC_DND_ACTION_FAIL_CLOSED,
++} SemanticDndProtocolAction;
++
++typedef struct {
++    SemanticDndProtocolPhase phase;
++    gboolean semantic;
++    gboolean discard_after_cancel;
++    gboolean cancel_write_complete;
++    gboolean cancel_acknowledged;
++    gboolean payload_complete;
++    gboolean complete_acknowledged;
++} SemanticDndProtocolState;
++
++SemanticReply semantic_dnd_validate_reply(const gchar *line,
++                                          gsize line_length,
++                                          const gchar *transfer_id);
++
++void semantic_dnd_protocol_init(SemanticDndProtocolState *state,
++                                gboolean semantic);
++SemanticDndProtocolAction semantic_dnd_protocol_ready(
++    SemanticDndProtocolState *state);
++SemanticDndProtocolAction semantic_dnd_protocol_begin_cancel(
++    SemanticDndProtocolState *state, gboolean discard_after_cancel);
++SemanticDndProtocolAction semantic_dnd_protocol_cancel_write(
++    SemanticDndProtocolState *state, gboolean success);
++SemanticDndProtocolAction semantic_dnd_protocol_cancel_ack(
++    SemanticDndProtocolState *state);
++SemanticDndProtocolAction semantic_dnd_protocol_payload_finished(
++    SemanticDndProtocolState *state, gboolean success);
++SemanticDndProtocolAction semantic_dnd_protocol_complete(
++    SemanticDndProtocolState *state, SemanticReply reply);
++SemanticDndProtocolAction semantic_dnd_protocol_timeout(
++    SemanticDndProtocolState *state);
++SemanticDndProtocolAction semantic_dnd_protocol_disconnect(
++    SemanticDndProtocolState *state);
++
++gboolean semantic_dnd_transform_input(gint framebuffer_width,
++                                      gint framebuffer_height,
++                                      gint display_x,
++                                      gint display_y,
++                                      gint display_width,
++                                      gint display_height,
++                                      gint scale_factor,
++                                      gdouble window_x,
++                                      gdouble window_y,
++                                      gint *input_x,
++                                      gint *input_y);
+diff -ruN a/src/spice-widget.c b/src/spice-widget.c
+--- a/src/spice-widget.c	2023-01-23 11:04:11.000000000 +0100
++++ b/src/spice-widget.c	2026-09-11 07:46:18.136932841 +0200
+@@ -17,9 +17,11 @@
+ #include "config.h"
+ 
+ #include <math.h>
++#include <string.h>
+ #include <glib.h>
+ #include <gdk/gdk.h>
+ #include <glib/gi18n-lib.h>
++#include <json-glib/json-glib.h>
+ 
+ #ifdef HAVE_X11_XKBLIB_H
+ #include <X11/XKBlib.h>
+@@ -55,6 +57,8 @@
+ #include "spice-gtk-session-priv.h"
+ #include "vncdisplaykeymap.h"
+ #include "spice-grabsequence-priv.h"
++#include "channel-port.h"
++#include "semantic-dnd.h"
+ 
+ 
+ /**
+@@ -110,6 +114,13 @@
+ };
+ 
+ #define DEFAULT_KEYPRESS_DELAY 100
++#define SEMANTIC_DND_PORT_NAME "com.utmapp.dnd.0"
++#define SEMANTIC_DND_PROTOCOL_VERSION 1
++#define SEMANTIC_DND_MAX_MESSAGE_BYTES (64 * 1024)
++#define SEMANTIC_DND_MAX_FILES 100
++#define SEMANTIC_DND_TIMEOUT_MS 5000
++#define SEMANTIC_DND_CANCEL_TIMEOUT_MS 4000
++#define SEMANTIC_DND_COMPLETE_TIMEOUT_MS 185000
+ 
+ static guint signals[SPICE_DISPLAY_LAST_SIGNAL];
+ 
+@@ -137,6 +148,10 @@
+ static GdkDevice *spice_gdk_window_get_pointing_device(GdkWindow *window);
+ static void gst_size_allocate(GtkWidget *widget, GdkRectangle *a, gpointer data);
+ static gboolean gst_draw_event(GtkWidget *widget, cairo_t *cr, gpointer data);
++static void transform_input(SpiceDisplay *display,
++                            double window_x, double window_y,
++                            int *input_x, int *input_y);
++static void semantic_dnd_dispose(SpiceDisplay *display);
+ 
+ /* ---------------------------------------------------------------- */
+ 
+@@ -460,6 +475,7 @@
+ 
+     DISPLAY_DEBUG(display, "spice display dispose");
+ 
++    semantic_dnd_dispose(display);
+     spice_cairo_image_destroy(display);
+     g_clear_object(&d->session);
+     d->gtk_session = NULL;
+@@ -535,22 +551,688 @@
+     return false;
+ }
+ 
+-static void file_transfer_callback(GObject *source_object,
+-                                   GAsyncResult *result,
+-                                   gpointer user_data G_GNUC_UNUSED)
++typedef struct {
++    GFile **files;
++    gchar **names;
++    gint64 *sizes;
++    guint64 *devices;
++    guint64 *inodes;
++    gint n_files;
++    gchar *transfer_id;
++    GCancellable *cancellable;
++    guint timeout_source;
++    SemanticDndProtocolState protocol;
++} SemanticDrop;
++
++typedef struct {
++    gpointer owner;
++    gboolean poisoned;
++} SemanticSessionGate;
++
++typedef struct {
++    SpicePortChannel *port;
++    GByteArray *read_buffer;
++    SemanticDrop *active;
++    SpiceSession *session;
++    SemanticSessionGate *gate;
++} SemanticDndState;
++
++typedef struct {
++    SpiceDisplay *display;
++    gchar *message;
++    gchar *transfer_id;
++    gboolean request;
++    gboolean start_after_write;
++} SemanticWrite;
++
++typedef struct {
++    SpiceDisplay *display;
++    gchar *transfer_id;
++} SemanticTransferCompletion;
++
++static GQuark semantic_dnd_state_quark(void)
++{
++    static gsize quark;
++
++    if (g_once_init_enter(&quark)) {
++        GQuark value = g_quark_from_static_string("spice-display-semantic-dnd-state");
++        g_once_init_leave(&quark, value);
++    }
++    return (GQuark)quark;
++}
++
++static void semantic_drop_free(SemanticDrop *drop)
++{
++    gint i;
++
++    if (drop == NULL)
++        return;
++    if (drop->timeout_source != 0)
++        g_source_remove(drop->timeout_source);
++    if (drop->cancellable != NULL)
++        g_cancellable_cancel(drop->cancellable);
++    for (i = 0; i < drop->n_files; i++) {
++        g_clear_object(&drop->files[i]);
++        g_clear_pointer(&drop->names[i], g_free);
++    }
++    g_clear_object(&drop->cancellable);
++    g_free(drop->files);
++    g_free(drop->names);
++    g_free(drop->sizes);
++    g_free(drop->devices);
++    g_free(drop->inodes);
++    g_free(drop->transfer_id);
++    g_free(drop);
++}
++
++static void semantic_dnd_state_free(gpointer data)
++{
++    SemanticDndState *state = data;
++
++    if (state == NULL)
++        return;
++    if (state->gate->owner == state) {
++        state->gate->owner = NULL;
++        state->gate->poisoned = TRUE;
++    }
++    semantic_drop_free(state->active);
++    g_clear_pointer(&state->read_buffer, g_byte_array_unref);
++    g_clear_object(&state->session);
++    g_free(state);
++}
++
++static SemanticDndState *semantic_dnd_state(SpiceDisplay *display, gboolean create)
++{
++    GObject *object = G_OBJECT(display);
++    GQuark quark = semantic_dnd_state_quark();
++    SemanticDndState *state = g_object_get_qdata(object, quark);
++
++    if (state == NULL && create) {
++        state = g_new0(SemanticDndState, 1);
++        state->session = g_object_ref(display->priv->session);
++        state->gate = g_object_get_data(G_OBJECT(state->session), "semantic-dnd-gate");
++        if (state->gate == NULL) {
++            state->gate = g_new0(SemanticSessionGate, 1);
++            g_object_set_data_full(G_OBJECT(state->session), "semantic-dnd-gate",
++                                   state->gate, g_free);
++        }
++        state->read_buffer = g_byte_array_new();
++        g_object_set_qdata_full(object, quark, state, semantic_dnd_state_free);
++    }
++    return state;
++}
++
++static void semantic_dnd_dispose(SpiceDisplay *display)
++{
++    GObject *object = G_OBJECT(display);
++    GQuark quark = semantic_dnd_state_quark();
++
++    g_object_set_qdata_full(object, quark, NULL, NULL);
++}
++
++static void semantic_drop_clear(SpiceDisplay *display)
++{
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++
++    if (state == NULL)
++        return;
++    semantic_drop_free(state->active);
++    state->active = NULL;
++    if (state->gate->owner == state)
++        state->gate->owner = NULL;
++}
++
++/* A transport write completion does not acknowledge guest processing. Do not
++ * release payload if the guest may still have a destination armed. Resetting
++ * the client port likewise cannot prove that its guest consumer cleared it. */
++static void semantic_abort_uncertain(SpiceDisplay *display, const gchar *reason)
++{
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++
++    if (state == NULL || state->active == NULL)
++        return;
++    state->gate->poisoned = TRUE;
++    g_warning("Semantic DnD stopped: %s; reconnect the viewer and restart the "
++              "guest helper before retrying", reason);
++    semantic_drop_clear(display);
++}
++
++static gboolean semantic_file_name_valid(const gchar *name)
++{
++    return name != NULL && name[0] != '\0' &&
++           g_utf8_validate(name, -1, NULL) && strlen(name) <= 255 &&
++           !g_str_equal(name, ".") && !g_str_equal(name, "..") &&
++           strchr(name, '/') == NULL;
++}
++
++static SemanticDrop *semantic_drop_new(gchar **file_urls, GError **error)
++{
++    SemanticDrop *drop;
++    gint i;
++    gint n_files = g_strv_length(file_urls);
++
++    if (n_files < 1 || n_files > SEMANTIC_DND_MAX_FILES) {
++        g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                    "a drop must contain between 1 and %d files",
++                    SEMANTIC_DND_MAX_FILES);
++        return NULL;
++    }
++
++    drop = g_new0(SemanticDrop, 1);
++    drop->n_files = n_files;
++    drop->files = g_new0(GFile *, n_files + 1);
++    drop->names = g_new0(gchar *, n_files + 1);
++    drop->sizes = g_new0(gint64, n_files);
++    drop->devices = g_new0(guint64, n_files);
++    drop->inodes = g_new0(guint64, n_files);
++    drop->transfer_id = g_uuid_string_random();
++    drop->cancellable = g_cancellable_new();
++    for (i = 0; i < n_files; i++) {
++        GFileInfo *info;
++        gchar *path;
++        gchar *name;
++
++        drop->files[i] = g_file_new_for_uri(file_urls[i]);
++        path = g_file_get_path(drop->files[i]);
++        if (path == NULL) {
++            g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
++                                "only local files can be transferred");
++            semantic_drop_free(drop);
++            return NULL;
++        }
++        g_free(path);
++
++        info = g_file_query_info(drop->files[i],
++                                 G_FILE_ATTRIBUTE_STANDARD_TYPE ","
++                                 G_FILE_ATTRIBUTE_STANDARD_SIZE ","
++                                 G_FILE_ATTRIBUTE_ACCESS_CAN_READ ","
++                                 G_FILE_ATTRIBUTE_UNIX_DEVICE ","
++                                 G_FILE_ATTRIBUTE_UNIX_INODE,
++                                 G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
++                                 NULL, error);
++        if (info == NULL) {
++            semantic_drop_free(drop);
++            return NULL;
++        }
++        name = g_file_get_basename(drop->files[i]);
++        if (g_file_info_get_file_type(info) != G_FILE_TYPE_REGULAR ||
++            !g_file_info_get_attribute_boolean(info, G_FILE_ATTRIBUTE_ACCESS_CAN_READ) ||
++            !semantic_file_name_valid(name) ||
++            g_file_info_get_size(info) > G_MAXINT64) {
++            g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                        "'%s' is not a readable regular file with a valid name",
++                        name != NULL ? name : "(invalid)");
++            g_free(name);
++            g_object_unref(info);
++            semantic_drop_free(drop);
++            return NULL;
++        }
++        drop->names[i] = name;
++        drop->sizes[i] = (gint64)g_file_info_get_size(info);
++        drop->devices[i] = g_file_info_get_attribute_uint32(info,
++                                                            G_FILE_ATTRIBUTE_UNIX_DEVICE);
++        drop->inodes[i] = g_file_info_get_attribute_uint64(info,
++                                                           G_FILE_ATTRIBUTE_UNIX_INODE);
++        g_object_unref(info);
++    }
++    return drop;
++}
++
++static gchar *semantic_drop_message(SpiceDisplay *display,
++                                    SemanticDrop *drop,
++                                    gint x,
++                                    gint y,
++                                    GError **error)
++{
++    SpiceDisplayPrivate *d = display->priv;
++    JsonBuilder *builder;
++    JsonGenerator *generator;
++    JsonNode *root;
++    gchar *json;
++    gchar *frame;
++    gint i;
++    gint display_id = get_display_id(display);
++
++    if (display_id < 0 || display_id > 31 || x < 0 || y < 0 ||
++        x >= d->area.width || y >= d->area.height ||
++        d->area.width <= 0 || d->area.height <= 0) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
++                            "drop coordinates are outside the framebuffer");
++        return NULL;
++    }
++
++    builder = json_builder_new();
++    json_builder_begin_object(builder);
++    json_builder_set_member_name(builder, "type");
++    json_builder_add_string_value(builder, "drop");
++    json_builder_set_member_name(builder, "version");
++    json_builder_add_int_value(builder, SEMANTIC_DND_PROTOCOL_VERSION);
++    json_builder_set_member_name(builder, "transferId");
++    json_builder_add_string_value(builder, drop->transfer_id);
++    json_builder_set_member_name(builder, "display");
++    json_builder_add_int_value(builder, display_id);
++    json_builder_set_member_name(builder, "x");
++    json_builder_add_int_value(builder, x);
++    json_builder_set_member_name(builder, "y");
++    json_builder_add_int_value(builder, y);
++    json_builder_set_member_name(builder, "framebufferWidth");
++    json_builder_add_int_value(builder, d->area.width);
++    json_builder_set_member_name(builder, "framebufferHeight");
++    json_builder_add_int_value(builder, d->area.height);
++    json_builder_set_member_name(builder, "files");
++    json_builder_begin_array(builder);
++    for (i = 0; i < drop->n_files; i++) {
++        json_builder_begin_object(builder);
++        json_builder_set_member_name(builder, "name");
++        json_builder_add_string_value(builder, drop->names[i]);
++        json_builder_set_member_name(builder, "size");
++        json_builder_add_int_value(builder, drop->sizes[i]);
++        json_builder_end_object(builder);
++    }
++    json_builder_end_array(builder);
++    json_builder_end_object(builder);
++
++    root = json_builder_get_root(builder);
++    generator = json_generator_new();
++    json_generator_set_root(generator, root);
++    json = json_generator_to_data(generator, NULL);
++    frame = g_strconcat(json, "\n", NULL);
++    if (strlen(frame) > SEMANTIC_DND_MAX_MESSAGE_BYTES) {
++        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_MESSAGE_TOO_LARGE,
++                            "drop metadata exceeds 64 KiB");
++        g_clear_pointer(&frame, g_free);
++    }
++    g_free(json);
++    g_object_unref(generator);
++    json_node_free(root);
++    g_object_unref(builder);
++    return frame;
++}
++
++static void semantic_start_payload(SpiceDisplay *display);
++static void semantic_cancel_then_start(SpiceDisplay *display, const gchar *reason);
++static gboolean semantic_metadata_timeout(gpointer user_data);
++static void semantic_port_write(SpiceDisplay *display,
++                                const gchar *message,
++                                const gchar *transfer_id,
++                                gboolean request,
++                                gboolean start_after_write);
++
++static void semantic_send_cancel(SpiceDisplay *display, const gchar *reason)
++{
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++    SemanticDrop *drop;
++    gchar *message;
++
++    if (state == NULL || state->active == NULL ||
++        state->active->protocol.phase != SEMANTIC_DND_PHASE_WAITING_CANCEL)
++        return;
++    drop = state->active;
++    if (drop->timeout_source != 0) {
++        g_source_remove(drop->timeout_source);
++        drop->timeout_source = 0;
++    }
++    g_warning("Semantic DnD metadata %s; requesting cancellation before fallback",
++              reason);
++    message = g_strdup_printf("{\"type\":\"cancel\",\"version\":%d,"
++                              "\"transferId\":\"%s\"}\n",
++                              SEMANTIC_DND_PROTOCOL_VERSION,
++                              drop->transfer_id);
++    drop->timeout_source = g_timeout_add_full(G_PRIORITY_DEFAULT,
++                                              SEMANTIC_DND_CANCEL_TIMEOUT_MS,
++                                              semantic_metadata_timeout,
++                                              g_object_ref(display),
++                                              g_object_unref);
++    semantic_port_write(display, message, drop->transfer_id, FALSE, TRUE);
++    g_free(message);
++}
++
++static void semantic_write_free(SemanticWrite *write)
++{
++    g_clear_object(&write->display);
++    g_free(write->message);
++    g_free(write->transfer_id);
++    g_free(write);
++}
++
++static void semantic_write_finished(GObject *source_object,
++                                    GAsyncResult *result,
++                                    gpointer user_data)
+ {
+-    SpiceMainChannel *channel = SPICE_MAIN_CHANNEL(source_object);
++    SemanticWrite *write = user_data;
++    SemanticDndState *state = semantic_dnd_state(write->display, FALSE);
+     GError *error = NULL;
+ 
+-    if (spice_main_channel_file_copy_finish(channel, result, &error))
++    spice_port_channel_write_finish(SPICE_PORT_CHANNEL(source_object), result, &error);
++    if (error != NULL)
++        g_warning("Semantic DnD port write failed: %s", error->message);
++
++    if (state != NULL && state->active != NULL &&
++        g_str_equal(state->active->transfer_id, write->transfer_id)) {
++        if (write->start_after_write &&
++            state->active->protocol.phase == SEMANTIC_DND_PHASE_WAITING_CANCEL) {
++            SemanticDndProtocolAction action =
++                semantic_dnd_protocol_cancel_write(&state->active->protocol,
++                                                   error == NULL);
++
++            if (action == SEMANTIC_DND_ACTION_FAIL_CLOSED)
++                semantic_abort_uncertain(write->display, "cancel write failed");
++            else if (action == SEMANTIC_DND_ACTION_START_PAYLOAD)
++                semantic_start_payload(write->display);
++            else if (action == SEMANTIC_DND_ACTION_FINISH)
++                semantic_drop_clear(write->display);
++        } else if (write->request && error != NULL &&
++                   state->active->protocol.phase == SEMANTIC_DND_PHASE_WAITING_READY) {
++            semantic_cancel_then_start(write->display, "request write failed");
++        }
++    }
++    g_clear_error(&error);
++    semantic_write_free(write);
++}
++
++static void semantic_port_write(SpiceDisplay *display,
++                                const gchar *message,
++                                const gchar *transfer_id,
++                                gboolean request,
++                                gboolean start_after_write)
++{
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++    SemanticWrite *write;
++
++    if (state == NULL || state->port == NULL) {
++        if (start_after_write || request)
++            semantic_abort_uncertain(display, "control port unavailable");
+         return;
++    }
+ 
+-    if (error != NULL && error->message != NULL)
+-        g_warning("File transfer failed with error: %s", error->message);
+-    else
+-        g_warning("File transfer failed");
++    write = g_new0(SemanticWrite, 1);
++    write->display = g_object_ref(display);
++    write->message = g_strdup(message);
++    write->transfer_id = g_strdup(transfer_id);
++    write->request = request;
++    write->start_after_write = start_after_write;
++    spice_port_channel_write_async(state->port,
++                                   write->message,
++                                   strlen(write->message),
++                                   NULL,
++                                   semantic_write_finished,
++                                   write);
++}
+ 
++static void semantic_cancel_then_start(SpiceDisplay *display, const gchar *reason)
++{
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++    SemanticDndProtocolAction action;
++
++    if (state == NULL || state->active == NULL ||
++        state->active->protocol.phase != SEMANTIC_DND_PHASE_WAITING_READY)
++        return;
++    action = semantic_dnd_protocol_begin_cancel(&state->active->protocol, FALSE);
++    if (action == SEMANTIC_DND_ACTION_SEND_CANCEL)
++        semantic_send_cancel(display, reason);
++    else if (action == SEMANTIC_DND_ACTION_FAIL_CLOSED)
++        semantic_abort_uncertain(display, "invalid cancellation transition");
++}
++
++static gboolean semantic_metadata_timeout(gpointer user_data)
++{
++    SpiceDisplay *display = SPICE_DISPLAY(user_data);
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++
++    if (state != NULL && state->active != NULL) {
++        SemanticDndProtocolPhase phase = state->active->protocol.phase;
++        SemanticDndProtocolAction action;
++
++        state->active->timeout_source = 0;
++        action = semantic_dnd_protocol_timeout(&state->active->protocol);
++        if (action == SEMANTIC_DND_ACTION_SEND_CANCEL)
++            semantic_send_cancel(display, "timed out");
++        else if (action == SEMANTIC_DND_ACTION_FAIL_CLOSED)
++            semantic_abort_uncertain(display,
++                phase == SEMANTIC_DND_PHASE_WAITING_COMPLETE ?
++                    "completion acknowledgement timed out" :
++                    "cancel acknowledgement timed out");
++    }
++    return G_SOURCE_REMOVE;
++}
++
++static void semantic_transfer_finished(GObject *source_object,
++                                       GAsyncResult *result,
++                                       gpointer user_data)
++{
++    SemanticTransferCompletion *completion = user_data;
++    SemanticDndState *state = semantic_dnd_state(completion->display, FALSE);
++    SemanticDndProtocolAction action = SEMANTIC_DND_ACTION_NONE;
++    GError *error = NULL;
++    gboolean success;
++
++    success = spice_main_channel_file_copy_finish(SPICE_MAIN_CHANNEL(source_object),
++                                                  result, &error);
++    if (!success) {
++        g_warning("File transfer failed with error: %s",
++                  error != NULL ? error->message : "unknown error");
++    }
++    if (state != NULL && state->active != NULL &&
++        g_str_equal(state->active->transfer_id, completion->transfer_id)) {
++        action = semantic_dnd_protocol_payload_finished(&state->active->protocol,
++                                                        success);
++        if (action == SEMANTIC_DND_ACTION_SEND_CANCEL) {
++            semantic_send_cancel(completion->display, "payload failed");
++        } else if (action == SEMANTIC_DND_ACTION_FINISH) {
++            semantic_drop_clear(completion->display);
++        } else if (action == SEMANTIC_DND_ACTION_FAIL_CLOSED) {
++            semantic_abort_uncertain(completion->display,
++                                     "invalid payload completion transition");
++        } else if (success &&
++                   state->active->protocol.phase ==
++                       SEMANTIC_DND_PHASE_WAITING_COMPLETE) {
++            state->active->timeout_source = g_timeout_add_full(
++                G_PRIORITY_DEFAULT, SEMANTIC_DND_COMPLETE_TIMEOUT_MS,
++                semantic_metadata_timeout, g_object_ref(completion->display),
++                g_object_unref);
++        }
++    }
+     g_clear_error(&error);
++    g_clear_object(&completion->display);
++    g_free(completion->transfer_id);
++    g_free(completion);
++}
++
++static gboolean semantic_drop_still_valid(SemanticDrop *drop, GError **error)
++{
++    gint i;
++
++    for (i = 0; i < drop->n_files; i++) {
++        GFileInfo *info;
++        gchar *name;
++        gboolean valid;
++
++        info = g_file_query_info(drop->files[i],
++                                 G_FILE_ATTRIBUTE_STANDARD_TYPE ","
++                                 G_FILE_ATTRIBUTE_STANDARD_SIZE ","
++                                 G_FILE_ATTRIBUTE_ACCESS_CAN_READ ","
++                                 G_FILE_ATTRIBUTE_UNIX_DEVICE ","
++                                 G_FILE_ATTRIBUTE_UNIX_INODE,
++                                 G_FILE_QUERY_INFO_NOFOLLOW_SYMLINKS,
++                                 NULL, error);
++        if (info == NULL)
++            return FALSE;
++        name = g_file_get_basename(drop->files[i]);
++        valid = g_file_info_get_file_type(info) == G_FILE_TYPE_REGULAR &&
++                g_file_info_get_attribute_boolean(info,
++                                                  G_FILE_ATTRIBUTE_ACCESS_CAN_READ) &&
++                g_file_info_get_size(info) == drop->sizes[i] &&
++                g_file_info_get_attribute_uint32(info,
++                                                 G_FILE_ATTRIBUTE_UNIX_DEVICE) ==
++                    drop->devices[i] &&
++                g_file_info_get_attribute_uint64(info,
++                                                 G_FILE_ATTRIBUTE_UNIX_INODE) ==
++                    drop->inodes[i] &&
++                g_strcmp0(name, drop->names[i]) == 0;
++        g_free(name);
++        g_object_unref(info);
++        if (!valid) {
++            g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
++                        "dropped file %d changed before transfer", i + 1);
++            return FALSE;
++        }
++    }
++    return TRUE;
++}
++
++static void semantic_start_payload(SpiceDisplay *display)
++{
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++    SemanticDrop *drop;
++    SemanticTransferCompletion *completion;
++    SpiceDisplayPrivate *d = display->priv;
++    GError *error = NULL;
++
++    if (state == NULL || state->active == NULL ||
++        state->active->protocol.phase != SEMANTIC_DND_PHASE_TRANSFERRING)
++        return;
++    drop = state->active;
++    if (drop->timeout_source != 0) {
++        g_source_remove(drop->timeout_source);
++        drop->timeout_source = 0;
++    }
++    if (d->main == NULL) {
++        if (drop->protocol.semantic)
++            semantic_abort_uncertain(display, "main channel unavailable after ready");
++        else
++            semantic_drop_clear(display);
++        return;
++    }
++    if (!semantic_drop_still_valid(drop, &error)) {
++        g_warning("Rejected SPICE file drop before payload transfer: %s",
++                  error != NULL ? error->message : "file changed");
++        g_clear_error(&error);
++        if (drop->protocol.semantic)
++            semantic_abort_uncertain(display, "source file changed after metadata");
++        else
++            semantic_drop_clear(display);
++        return;
++    }
++
++    completion = g_new0(SemanticTransferCompletion, 1);
++    completion->display = g_object_ref(display);
++    completion->transfer_id = g_strdup(drop->transfer_id);
++    spice_main_channel_file_copy_async(d->main,
++                                       drop->files,
++                                       0,
++                                       drop->cancellable,
++                                       NULL,
++                                       NULL,
++                                       semantic_transfer_finished,
++                                       completion);
++}
++
++static void semantic_handle_reply(SpiceDisplay *display,
++                                  const gchar *line,
++                                  gsize line_length)
++{
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++    SemanticReply reply;
++
++    if (state == NULL || state->active == NULL)
++        return;
++    reply = semantic_dnd_validate_reply(line, line_length,
++                                        state->active->transfer_id);
++    if (reply == SEMANTIC_REPLY_UNRELATED)
++        return;
++    if (state->active->protocol.phase == SEMANTIC_DND_PHASE_WAITING_CANCEL) {
++        if (reply == SEMANTIC_REPLY_CANCELLED) {
++            SemanticDndProtocolAction action;
++
++            DISPLAY_DEBUG(display, "semantic DnD cancellation acknowledged id=%s",
++                          state->active->transfer_id);
++            action = semantic_dnd_protocol_cancel_ack(&state->active->protocol);
++            if (action == SEMANTIC_DND_ACTION_FINISH)
++                semantic_drop_clear(display);
++            else if (action == SEMANTIC_DND_ACTION_START_PAYLOAD)
++                semantic_start_payload(display);
++        }
++        return;
++    }
++    if (state->active->protocol.phase == SEMANTIC_DND_PHASE_TRANSFERRING ||
++        state->active->protocol.phase == SEMANTIC_DND_PHASE_WAITING_COMPLETE) {
++        SemanticDndProtocolAction action =
++            semantic_dnd_protocol_complete(&state->active->protocol, reply);
++
++        if (action == SEMANTIC_DND_ACTION_FINISH)
++            semantic_drop_clear(display);
++        else if (action == SEMANTIC_DND_ACTION_FAIL_CLOSED)
++            semantic_abort_uncertain(display,
++                                     "received an invalid completion response");
++        return;
++    }
++    if (reply == SEMANTIC_REPLY_READY) {
++        SemanticDndProtocolAction action =
++            semantic_dnd_protocol_ready(&state->active->protocol);
++
++        DISPLAY_DEBUG(display, "semantic DnD ready id=%s",
++                      state->active->transfer_id);
++        if (action == SEMANTIC_DND_ACTION_START_PAYLOAD)
++            semantic_start_payload(display);
++        else
++            semantic_abort_uncertain(display, "invalid ready transition");
++    } else if (reply == SEMANTIC_REPLY_ERROR) {
++        semantic_cancel_then_start(display, "was rejected by the guest");
++    } else {
++        semantic_cancel_then_start(display, "received a malformed response");
++    }
++}
++
++static void semantic_port_data(SpicePortChannel *port,
++                               gpointer data,
++                               gint size,
++                               SpiceDisplay *display)
++{
++    SemanticDndState *state = semantic_dnd_state(display, FALSE);
++    guint8 *newline;
++
++    if (state == NULL || state->port != port || size <= 0)
++        return;
++    if ((gsize)size > SEMANTIC_DND_MAX_MESSAGE_BYTES - state->read_buffer->len) {
++        g_byte_array_set_size(state->read_buffer, 0);
++        semantic_cancel_then_start(display, "received an oversized response");
++        return;
++    }
++    g_byte_array_append(state->read_buffer, data, size);
++    while ((newline = memchr(state->read_buffer->data, '\n',
++                             state->read_buffer->len)) != NULL) {
++        gsize line_length = newline - state->read_buffer->data;
++        gchar *line;
++
++        if (line_length + 1 > SEMANTIC_DND_MAX_MESSAGE_BYTES) {
++            g_byte_array_remove_range(state->read_buffer, 0, line_length + 1);
++            semantic_cancel_then_start(display, "received an oversized response");
++            continue;
++        }
++        line = g_strndup((const gchar *)state->read_buffer->data, line_length);
++        g_byte_array_remove_range(state->read_buffer, 0, line_length + 1);
++        semantic_handle_reply(display, line, line_length);
++        g_free(line);
++    }
++    if (state->read_buffer->len >= SEMANTIC_DND_MAX_MESSAGE_BYTES) {
++        g_byte_array_set_size(state->read_buffer, 0);
++        semantic_cancel_then_start(display, "received an oversized response");
++    }
++}
++
++static void semantic_port_name_changed(SpicePortChannel *port,
++                                       GParamSpec *pspec G_GNUC_UNUSED,
++                                       SpiceDisplay *display)
++{
++    SemanticDndState *state = semantic_dnd_state(display, TRUE);
++    gchar *name = NULL;
++
++    g_object_get(port, "port-name", &name, NULL);
++    if (g_strcmp0(name, SEMANTIC_DND_PORT_NAME) == 0) {
++        state->port = port;
++        DISPLAY_DEBUG(display, "semantic DnD control port connected: %s", name);
++    }
++    g_free(name);
+ }
+ 
+ static void drag_data_received_callback(SpiceDisplay *self,
+@@ -564,10 +1246,14 @@
+ {
+     const guchar *buf;
+     gchar **file_urls;
+-    int n_files;
+     SpiceDisplayPrivate *d = self->priv;
+-    int i = 0;
+-    GFile **files;
++    SemanticDndState *state = semantic_dnd_state(self, TRUE);
++    SemanticDrop *drop;
++    gchar *message;
++    gboolean port_opened = FALSE;
++    GError *error = NULL;
++    gint guest_x;
++    gint guest_y;
+ 
+     /* We get a buf like:
+      * file:///root/a.txt\r\nfile:///root/b.txt\r\n
+@@ -577,19 +1263,56 @@
+     g_return_if_fail(buf != NULL);
+ 
+     file_urls = g_uri_list_extract_uris((const gchar*)buf);
+-    n_files = g_strv_length(file_urls);
+-    files = g_new0(GFile*, n_files + 1);
+-    for (i = 0; i < n_files; i++) {
+-        files[i] = g_file_new_for_uri(file_urls[i]);
+-    }
++    drop = semantic_drop_new(file_urls, &error);
+     g_strfreev(file_urls);
++    if (drop == NULL || d->main == NULL) {
++        g_warning("Rejected SPICE file drop: %s",
++                  error != NULL ? error->message : "main channel is unavailable");
++        g_clear_error(&error);
++        semantic_drop_free(drop);
++        gtk_drag_finish(drag_context, FALSE, FALSE, time);
++        return;
++    }
++    if (state->gate->owner != NULL || state->gate->poisoned) {
++        g_warning("Rejected SPICE file drop: this session has an active or "
++                  "unacknowledged semantic transfer");
++        semantic_drop_free(drop);
++        gtk_drag_finish(drag_context, FALSE, FALSE, time);
++        return;
++    }
+ 
+-    spice_main_channel_file_copy_async(d->main, files, 0, NULL, NULL, NULL, file_transfer_callback,
+-                                       NULL);
+-    for (i = 0; i < n_files; i++) {
+-        g_object_unref(files[i]);
++    transform_input(self, x, y, &guest_x, &guest_y);
++    message = semantic_drop_message(self, drop, guest_x, guest_y, &error);
++    if (message == NULL) {
++        g_warning("Rejected SPICE file drop: %s", error->message);
++        g_clear_error(&error);
++        semantic_drop_free(drop);
++        gtk_drag_finish(drag_context, FALSE, FALSE, time);
++        return;
+     }
+-    g_free(files);
++
++    if (state->port != NULL)
++        g_object_get(state->port, "port-opened", &port_opened, NULL);
++    if (!port_opened) {
++        semantic_dnd_protocol_init(&drop->protocol, FALSE);
++        state->active = drop;
++        state->gate->owner = state;
++        semantic_start_payload(self);
++        g_free(message);
++        gtk_drag_finish(drag_context, TRUE, FALSE, time);
++        return;
++    }
++
++    state->active = drop;
++    state->gate->owner = state;
++    semantic_dnd_protocol_init(&drop->protocol, TRUE);
++    drop->timeout_source = g_timeout_add_full(G_PRIORITY_DEFAULT,
++                                              SEMANTIC_DND_TIMEOUT_MS,
++                                              semantic_metadata_timeout,
++                                              g_object_ref(self),
++                                              g_object_unref);
++    semantic_port_write(self, message, drop->transfer_id, TRUE, FALSE);
++    g_free(message);
+ 
+     gtk_drag_finish(drag_context, TRUE, FALSE, time);
+ }
+@@ -2090,7 +2813,6 @@
+ {
+     SpiceDisplayPrivate *d = display->priv;
+     int display_x, display_y, display_w, display_h;
+-    double is;
+     gint scale_factor;
+ 
+     spice_display_get_scaling(display, NULL,
+@@ -2112,13 +2834,12 @@
+        coordinates in the inverse direction (window -> display) as the fb size
+        (display -> window).
+     */
+-    is = ((double)(d->area.width-1) / (double)(display_w-1)) * scale_factor;
+-
+-    window_x -= display_x / scale_factor;
+-    window_y -= display_y / scale_factor;
+-
+-    *input_x = floor (window_x * is);
+-    *input_y = floor (window_y * is);
++    semantic_dnd_transform_input(d->area.width, d->area.height,
++                                 display_x, display_y,
++                                 display_w, display_h,
++                                 scale_factor,
++                                 window_x, window_y,
++                                 input_x, input_y);
+ }
+ 
+ static gboolean motion_event(GtkWidget *widget, GdkEventMotion *motion)
+@@ -3457,6 +4178,20 @@
+         return;
+     }
+ 
++    if (SPICE_IS_PORT_CHANNEL(channel)) {
++        SpicePortChannel *port = SPICE_PORT_CHANNEL(channel);
++
++        spice_g_signal_connect_object(port, "notify::port-name",
++                                      G_CALLBACK(semantic_port_name_changed),
++                                      display, 0);
++        spice_g_signal_connect_object(port, "port-data",
++                                      G_CALLBACK(semantic_port_data),
++                                      display, 0);
++        semantic_port_name_changed(port, NULL, display);
++        spice_channel_connect(channel);
++        return;
++    }
++
+ #ifdef USE_SMARTCARD
+     if (SPICE_IS_SMARTCARD_CHANNEL(channel)) {
+         d->smartcard = SPICE_SMARTCARD_CHANNEL(channel);
+@@ -3499,6 +4234,20 @@
+         return;
+     }
+ 
++    if (SPICE_IS_PORT_CHANNEL(channel)) {
++        SemanticDndState *state = semantic_dnd_state(display, FALSE);
++
++        if (state != NULL && state->port == SPICE_PORT_CHANNEL(channel)) {
++            state->port = NULL;
++            g_byte_array_set_size(state->read_buffer, 0);
++            if (state->active != NULL &&
++                semantic_dnd_protocol_disconnect(&state->active->protocol) ==
++                    SEMANTIC_DND_ACTION_FAIL_CLOSED)
++                semantic_abort_uncertain(display, "control port disconnected");
++        }
++        return;
++    }
++
+ #ifdef USE_SMARTCARD
+     if (SPICE_IS_SMARTCARD_CHANNEL(channel)) {
+         d->smartcard = NULL;
+diff -ruN a/tests/meson.build b/tests/meson.build
+--- a/tests/meson.build	2023-01-23 11:04:11.000000000 +0100
++++ b/tests/meson.build	2026-09-11 07:46:18.137590115 +0200
+@@ -37,3 +37,13 @@
+     test(name, exe)
+   endif
+ endforeach
++
++if spice_gtk_has_gtk
++  semantic_dnd_test = executable(
++    'test-semantic-dnd',
++    sources : ['semantic-dnd.c', '../src/semantic-dnd.c'],
++    include_directories : include_directories('../src'),
++    dependencies : [spice_client_glib_dep, spice_gtk_deps],
++  )
++  test('test-semantic-dnd', semantic_dnd_test)
++endif
+diff -ruN a/tests/semantic-dnd.c b/tests/semantic-dnd.c
+--- a/tests/semantic-dnd.c	1970-01-01 01:00:00.000000000 +0100
++++ b/tests/semantic-dnd.c	2026-09-11 07:46:18.138229178 +0200
+@@ -0,0 +1,325 @@
++#include <glib.h>
++#include <string.h>
++
++#include "semantic-dnd.h"
++
++static const gchar *transfer_id = "11111111-2222-4333-8444-555555555555";
++
++static gchar *complete_message(const gchar *identifier)
++{
++    return g_strdup_printf(
++        "{\"type\":\"complete\",\"version\":1,\"transferId\":\"%s\"}",
++        identifier);
++}
++
++static void test_ready_validation(void)
++{
++    gchar *ready = g_strdup_printf(
++        "{\"type\":\"ready\",\"version\":1,\"transferId\":\"%s\","
++        "\"target\":{\"kind\":\"nautilus\",\"uri\":\"file:///home/u/Documents\","
++        "\"confidence\":\"high\",\"diagnostic\":{}}}", transfer_id);
++    gchar *empty_target = g_strdup_printf(
++        "{\"type\":\"ready\",\"version\":1,\"transferId\":\"%s\","
++        "\"target\":{}}", transfer_id);
++    gchar *extra_target = g_strdup_printf(
++        "{\"type\":\"ready\",\"version\":1,\"transferId\":\"%s\","
++        "\"target\":{\"kind\":\"desktop\",\"uri\":\"file:///tmp\","
++        "\"confidence\":\"high\",\"path\":\"/tmp\"}}", transfer_id);
++
++    g_assert_cmpint(semantic_dnd_validate_reply(ready, strlen(ready), transfer_id),
++                    ==, SEMANTIC_REPLY_READY);
++    g_assert_cmpint(semantic_dnd_validate_reply(empty_target, strlen(empty_target), transfer_id),
++                    ==, SEMANTIC_REPLY_INVALID);
++    g_assert_cmpint(semantic_dnd_validate_reply(extra_target, strlen(extra_target), transfer_id),
++                    ==, SEMANTIC_REPLY_INVALID);
++    g_free(ready);
++    g_free(empty_target);
++    g_free(extra_target);
++}
++
++static void test_control_and_framing_validation(void)
++{
++    gchar *cancelled = g_strdup_printf(
++        "{\"type\":\"cancelled\",\"version\":1,\"transferId\":\"%s\"}",
++        transfer_id);
++    gchar *unrelated = g_strdup(
++        "{\"type\":\"ready\",\"version\":1,"
++        "\"transferId\":\"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\",\"target\":{}}");
++    gchar with_nul[] = "{\"type\":\"ready\"}\0junk";
++    gchar *escaped_nul = g_strdup_printf(
++        "{\"type\":\"ready\\u0000evil\",\"version\":1,\"transferId\":\"%s\","
++        "\"target\":{\"kind\":\"desktop\",\"uri\":\"file:///tmp\","
++        "\"confidence\":\"high\"}}", transfer_id);
++
++    g_assert_cmpint(semantic_dnd_validate_reply(cancelled, strlen(cancelled), transfer_id),
++                    ==, SEMANTIC_REPLY_CANCELLED);
++    g_assert_cmpint(semantic_dnd_validate_reply(unrelated, strlen(unrelated), transfer_id),
++                    ==, SEMANTIC_REPLY_UNRELATED);
++    g_assert_cmpint(semantic_dnd_validate_reply(with_nul, sizeof(with_nul) - 1, transfer_id),
++                    ==, SEMANTIC_REPLY_INVALID);
++    g_assert_cmpint(semantic_dnd_validate_reply(escaped_nul, strlen(escaped_nul), transfer_id),
++                    ==, SEMANTIC_REPLY_INVALID);
++    g_free(cancelled);
++    g_free(unrelated);
++    g_free(escaped_nul);
++}
++
++static void test_coordinate_transform(void)
++{
++    gint x;
++    gint y;
++
++    g_assert_true(semantic_dnd_transform_input(1280, 720, 0, 59, 500, 281,
++                                               1, 250, 60, &x, &y));
++    g_assert_cmpint(x, ==, 640);
++    g_assert_cmpint(y, ==, 2);
++
++    g_assert_true(semantic_dnd_transform_input(1280, 720, 0, 119, 1000, 563,
++                                               1, 999, 399, &x, &y));
++    g_assert_cmpint(x, ==, 1279);
++    g_assert_cmpint(y, >=, 0);
++
++    /* Preserve upstream's integer division of odd physical offsets. */
++    g_assert_true(semantic_dnd_transform_input(1280, 720, 3, 119, 1000, 563,
++                                               2, 1, 59, &x, &y));
++    g_assert_cmpint(x, ==, 0);
++    g_assert_cmpint(y, ==, 0);
++
++    g_assert_false(semantic_dnd_transform_input(0, 720, 0, 0, 100, 100,
++                                                1, 0, 0, &x, &y));
++}
++
++static void test_strict_json(void)
++{
++    const gchar *formats[] = {
++        "{\"type\":\"error\",\"type\":\"cancelled\",\"version\":1,\"transferId\":\"%s\"}",
++        "{\"type\":\"error\",\"ty\\u0070e\":\"cancelled\",\"version\":1,\"transferId\":\"%s\"}",
++        "{\"type\":\"cancelled\",\"version\":1.0,\"transferId\":\"%s\"}",
++        "{\"type\":\"cancelled\",\"version\":true,\"transferId\":\"%s\"}",
++        "{\"type\":\"ready\",\"version\":1,\"transferId\":\"%s\",\"target\":{\"kind\":\"desktop\",\"uri\":\"file:///tmp\",\"confidence\":\"high\",\"diagnostic\":{\"x\":1,\"x\":2}}}"
++    };
++    guint i;
++    gchar *large = g_malloc0(65537);
++    gchar *cancelled = g_strdup_printf(
++        "{\"type\":\"cancelled\",\"version\":1,\"transferId\":\"%s\"}", transfer_id);
++
++    for (i = 0; i < G_N_ELEMENTS(formats); i++) {
++        gchar *message = g_strdup_printf(formats[i], transfer_id);
++        g_assert_cmpint(semantic_dnd_validate_reply(message, strlen(message), transfer_id),
++                       ==, SEMANTIC_REPLY_INVALID);
++        g_free(message);
++    }
++    memset(large, ' ', 65536);
++    memcpy(large, cancelled, strlen(cancelled));
++    g_assert_cmpint(semantic_dnd_validate_reply(large, 65536, transfer_id),
++                   ==, SEMANTIC_REPLY_INVALID);
++    g_assert_cmpint(semantic_dnd_validate_reply(large, 65535, transfer_id),
++                   ==, SEMANTIC_REPLY_CANCELLED);
++    g_free(cancelled);
++    g_free(large);
++}
++
++static void test_resource_limits(void)
++{
++    gchar nested[67];
++    const gchar invalid_utf8[] = "{\"type\":\"\xff\"}";
++
++    memset(nested, '[', 33);
++    memset(nested + 33, ']', 33);
++    nested[66] = '\0';
++    g_assert_cmpint(semantic_dnd_validate_reply(nested, 66, transfer_id),
++                   ==, SEMANTIC_REPLY_INVALID);
++    g_assert_cmpint(semantic_dnd_validate_reply(invalid_utf8,
++                                              sizeof(invalid_utf8) - 1, transfer_id),
++                   ==, SEMANTIC_REPLY_INVALID);
++}
++
++static void test_complete_validation(void)
++{
++    gchar *complete = complete_message(transfer_id);
++    gchar *wrong_id = complete_message(
++        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee");
++    gchar *extra = g_strdup_printf(
++        "{\"type\":\"complete\",\"version\":1,\"transferId\":\"%s\","
++        "\"files\":[]}", transfer_id);
++
++    g_assert_cmpint(semantic_dnd_validate_reply(complete, strlen(complete), transfer_id),
++                    ==, SEMANTIC_REPLY_COMPLETE);
++    g_assert_cmpint(semantic_dnd_validate_reply(wrong_id, strlen(wrong_id), transfer_id),
++                    ==, SEMANTIC_REPLY_UNRELATED);
++    g_assert_cmpint(semantic_dnd_validate_reply(extra, strlen(extra), transfer_id),
++                    ==, SEMANTIC_REPLY_INVALID);
++    g_free(complete);
++    g_free(wrong_id);
++    g_free(extra);
++}
++
++static void test_cancel_barrier_requires_write_and_ack(void)
++{
++    SemanticDndProtocolState state;
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    g_assert_cmpint(semantic_dnd_protocol_begin_cancel(&state, FALSE),
++                    ==, SEMANTIC_DND_ACTION_SEND_CANCEL);
++
++    /* A pre-sent acknowledgement cannot release the fallback payload. */
++    g_assert_cmpint(semantic_dnd_protocol_cancel_ack(&state),
++                    ==, SEMANTIC_DND_ACTION_NONE);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_WAITING_CANCEL);
++    g_assert_true(state.cancel_acknowledged);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_write(&state, TRUE),
++                    ==, SEMANTIC_DND_ACTION_START_PAYLOAD);
++    g_assert_true(state.cancel_write_complete);
++    g_assert_false(state.semantic);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_TRANSFERRING);
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    semantic_dnd_protocol_begin_cancel(&state, FALSE);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_write(&state, TRUE),
++                    ==, SEMANTIC_DND_ACTION_NONE);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_ack(&state),
++                    ==, SEMANTIC_DND_ACTION_START_PAYLOAD);
++}
++
++static void test_cancel_write_failure_fails_closed(void)
++{
++    SemanticDndProtocolState state;
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    semantic_dnd_protocol_begin_cancel(&state, FALSE);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_ack(&state),
++                    ==, SEMANTIC_DND_ACTION_NONE);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_write(&state, FALSE),
++                    ==, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_FAILED);
++}
++
++static void test_payload_failure_cancel_barrier_discards(void)
++{
++    SemanticDndProtocolState state;
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    semantic_dnd_protocol_ready(&state);
++    g_assert_cmpint(semantic_dnd_protocol_payload_finished(&state, FALSE),
++                    ==, SEMANTIC_DND_ACTION_SEND_CANCEL);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_WAITING_CANCEL);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_ack(&state),
++                    ==, SEMANTIC_DND_ACTION_NONE);
++    g_assert_true(state.cancel_acknowledged);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_write(&state, TRUE),
++                    ==, SEMANTIC_DND_ACTION_FINISH);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_DONE);
++}
++
++static void test_ready_timeout_enters_cancel_barrier(void)
++{
++    SemanticDndProtocolState state;
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    g_assert_cmpint(semantic_dnd_protocol_timeout(&state),
++                    ==, SEMANTIC_DND_ACTION_SEND_CANCEL);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_WAITING_CANCEL);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_write(&state, TRUE),
++                    ==, SEMANTIC_DND_ACTION_NONE);
++    g_assert_cmpint(semantic_dnd_protocol_cancel_ack(&state),
++                    ==, SEMANTIC_DND_ACTION_START_PAYLOAD);
++}
++
++static void test_semantic_payload_waits_for_complete(void)
++{
++    SemanticDndProtocolState state;
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    g_assert_cmpint(semantic_dnd_protocol_ready(&state),
++                    ==, SEMANTIC_DND_ACTION_START_PAYLOAD);
++    g_assert_cmpint(semantic_dnd_protocol_payload_finished(&state, TRUE),
++                    ==, SEMANTIC_DND_ACTION_NONE);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_WAITING_COMPLETE);
++
++    /* This is the >=0.6 s guest stability/move window. The gate stays owned. */
++    g_assert_cmpint(semantic_dnd_protocol_complete(&state, SEMANTIC_REPLY_UNRELATED),
++                    ==, SEMANTIC_DND_ACTION_NONE);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_WAITING_COMPLETE);
++    g_assert_cmpint(semantic_dnd_protocol_complete(&state, SEMANTIC_REPLY_COMPLETE),
++                    ==, SEMANTIC_DND_ACTION_FINISH);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_DONE);
++}
++
++static void test_early_complete_still_waits_for_payload_finish(void)
++{
++    SemanticDndProtocolState state;
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    semantic_dnd_protocol_ready(&state);
++    g_assert_cmpint(semantic_dnd_protocol_complete(&state, SEMANTIC_REPLY_COMPLETE),
++                    ==, SEMANTIC_DND_ACTION_NONE);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_TRANSFERRING);
++    g_assert_cmpint(semantic_dnd_protocol_payload_finished(&state, TRUE),
++                    ==, SEMANTIC_DND_ACTION_FINISH);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_DONE);
++}
++
++static void test_complete_timeout_and_disconnect_fail_closed(void)
++{
++    SemanticDndProtocolState state;
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    semantic_dnd_protocol_ready(&state);
++    semantic_dnd_protocol_payload_finished(&state, TRUE);
++    g_assert_cmpint(semantic_dnd_protocol_timeout(&state),
++                    ==, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_FAILED);
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    semantic_dnd_protocol_ready(&state);
++    semantic_dnd_protocol_payload_finished(&state, TRUE);
++    g_assert_cmpint(semantic_dnd_protocol_complete(&state, SEMANTIC_REPLY_ERROR),
++                    ==, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_FAILED);
++
++    semantic_dnd_protocol_init(&state, TRUE);
++    semantic_dnd_protocol_ready(&state);
++    semantic_dnd_protocol_payload_finished(&state, TRUE);
++    g_assert_cmpint(semantic_dnd_protocol_disconnect(&state),
++                    ==, SEMANTIC_DND_ACTION_FAIL_CLOSED);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_FAILED);
++}
++
++static void test_plain_payload_does_not_wait_for_complete(void)
++{
++    SemanticDndProtocolState state;
++
++    semantic_dnd_protocol_init(&state, FALSE);
++    g_assert_cmpint(semantic_dnd_protocol_payload_finished(&state, TRUE),
++                    ==, SEMANTIC_DND_ACTION_FINISH);
++    g_assert_cmpint(state.phase, ==, SEMANTIC_DND_PHASE_DONE);
++}
++
++int main(int argc, char **argv)
++{
++    g_test_init(&argc, &argv, NULL);
++    g_test_add_func("/semantic-dnd/reply/ready", test_ready_validation);
++    g_test_add_func("/semantic-dnd/reply/control-and-framing",
++                    test_control_and_framing_validation);
++    g_test_add_func("/semantic-dnd/coordinates", test_coordinate_transform);
++    g_test_add_func("/semantic-dnd/reply/strict-json", test_strict_json);
++    g_test_add_func("/semantic-dnd/reply/resource-limits", test_resource_limits);
++    g_test_add_func("/semantic-dnd/reply/complete", test_complete_validation);
++    g_test_add_func("/semantic-dnd/state/cancel-barrier",
++                    test_cancel_barrier_requires_write_and_ack);
++    g_test_add_func("/semantic-dnd/state/cancel-write-failure",
++                    test_cancel_write_failure_fails_closed);
++    g_test_add_func("/semantic-dnd/state/payload-failure-cancel",
++                    test_payload_failure_cancel_barrier_discards);
++    g_test_add_func("/semantic-dnd/state/ready-timeout-cancel",
++                    test_ready_timeout_enters_cancel_barrier);
++    g_test_add_func("/semantic-dnd/state/wait-for-complete",
++                    test_semantic_payload_waits_for_complete);
++    g_test_add_func("/semantic-dnd/state/early-complete",
++                    test_early_complete_still_waits_for_payload_finish);
++    g_test_add_func("/semantic-dnd/state/complete-fail-closed",
++                    test_complete_timeout_and_disconnect_fail_closed);
++    g_test_add_func("/semantic-dnd/state/plain-completion",
++                    test_plain_payload_does_not_wait_for_complete);
++    return g_test_run();
++}

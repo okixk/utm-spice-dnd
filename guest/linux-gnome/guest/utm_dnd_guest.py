@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 
 import argparse
+import ctypes
 import errno
 import json
 import math
@@ -46,6 +47,64 @@ class ProtocolError(ValueError):
     pass
 
 
+def rename_no_replace(source: Path, destination: Path) -> None:
+    """Atomically capture or restore a pathname without clobbering another file.
+
+    Linux renameat2 is required; unsupported filesystems fail closed. A check
+    followed by os.rename would overwrite a file created between those calls.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(libc, "renameat2", None)
+    if rename is None:
+        raise OSError(errno.ENOSYS, "atomic no-replace rename is unavailable")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(-100, os.fsencode(source), -100, os.fsencode(destination), 1) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
+def validate_transfer_id(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ProtocolError("invalid transferId")
+    try:
+        return str(uuid.UUID(value))
+    except ValueError as error:
+        raise ProtocolError("invalid transferId") from error
+
+
+def decode_control_message(raw: bytes) -> Any:
+    text = raw.decode("utf-8")
+    depth, quoted, escaped = 0, False, False
+    for character in text:
+        if quoted:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quoted = False
+        elif character == '"':
+            quoted = True
+        elif character in "[{":
+            depth += 1
+            if depth > 16:
+                raise ProtocolError("JSON nesting limit exceeded")
+        elif character in "]}":
+            depth -= 1
+
+    def unique_object(pairs):
+        result = dict(pairs)
+        if len(result) != len(pairs):
+            raise ProtocolError("duplicate JSON member")
+        return result
+
+    def reject_constant(value):
+        raise ProtocolError("invalid JSON numeric constant")
+
+    return json.loads(text, object_pairs_hook=unique_object, parse_constant=reject_constant)
+
+
 @dataclass(frozen=True)
 class ExpectedFile:
     name: str
@@ -82,7 +141,11 @@ def validate_basename(name: Any) -> str:
         raise ProtocolError("invalid file name")
     if name in (".", "..") or PurePath(name).name != name or "/" in name:
         raise ProtocolError("file name must be a basename")
-    if len(name.encode("utf-8")) > 255:
+    try:
+        encoded_name = name.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ProtocolError("invalid UTF-8 file name") from error
+    if len(encoded_name) > 255:
         raise ProtocolError("file name is too long")
     return name
 
@@ -100,10 +163,7 @@ def validate_drop_message(message: Any) -> tuple[str, int, float, float, float, 
     }:
         raise ProtocolError("invalid drop message fields")
 
-    try:
-        transfer_id = str(uuid.UUID(message["transferId"]))
-    except (KeyError, TypeError, ValueError) as error:
-        raise ProtocolError("invalid transferId") from error
+    transfer_id = validate_transfer_id(message.get("transferId"))
 
     display = message.get("display")
     if not isinstance(display, int) or isinstance(display, bool) or not 0 <= display <= 31:
@@ -112,9 +172,15 @@ def validate_drop_message(message: Any) -> tuple[str, int, float, float, float, 
     values = []
     for key in ("x", "y", "framebufferWidth", "framebufferHeight"):
         value = message.get(key)
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ProtocolError(f"invalid {key}")
-        values.append(float(value))
+        try:
+            converted = float(value)
+        except OverflowError as error:
+            raise ProtocolError(f"invalid {key}") from error
+        if not math.isfinite(converted):
+            raise ProtocolError(f"invalid {key}")
+        values.append(converted)
     x, y, width, height = values
     if width <= 0 or height <= 0 or x < 0 or y < 0 or x >= width or y >= height:
         raise ProtocolError("drop coordinates are outside the framebuffer")
@@ -144,10 +210,7 @@ def validate_cancel_message(message: Any) -> str:
         raise ProtocolError("unsupported protocol version")
     if set(message) != {"type", "version", "transferId"}:
         raise ProtocolError("invalid cancel message fields")
-    try:
-        return str(uuid.UUID(message["transferId"]))
-    except (KeyError, TypeError, ValueError) as error:
-        raise ProtocolError("invalid transferId") from error
+    return validate_transfer_id(message.get("transferId"))
 
 
 def name_matches_received(expected: str, candidate: str) -> bool:
@@ -164,7 +227,16 @@ def name_matches_received(expected: str, candidate: str) -> bool:
 
 def duplicate_name(name: str, number: int) -> str:
     path = PurePath(name)
-    return f"{path.stem} ({number}){path.suffix}"
+    marker = f" ({number})"
+
+    def truncate_utf8(value: str, limit: int) -> str:
+        return value.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+    suffix_budget = max(0, 255 - len(marker.encode("utf-8")) - 1)
+    suffix = truncate_utf8(path.suffix, suffix_budget)
+    stem_budget = 255 - len(marker.encode("utf-8")) - len(suffix.encode("utf-8"))
+    stem = truncate_utf8(path.stem, stem_budget)
+    return f"{stem}{marker}{suffix}"
 
 
 def xdg_directory(kind: GLib.UserDirectory, fallback: str) -> Path:
@@ -332,14 +404,17 @@ class GuestHelper:
         view = memoryview(encoded)
         deadline = time.monotonic() + PORT_WRITE_TIMEOUT
         while view and self.fd is not None:
+            if time.monotonic() >= deadline:
+                self.log("control port write timed out")
+                self.close_port()
+                return
             try:
                 written = os.write(self.fd, view)
+                if written <= 0:
+                    time.sleep(0.01)
+                    continue
                 view = view[written:]
             except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    self.log("control port write timed out")
-                    self.close_port()
-                    return
                 time.sleep(0.01)
             except OSError as error:
                 self.log(f"port write failed: {error}")
@@ -373,9 +448,16 @@ class GuestHelper:
         try:
             if isinstance(message, dict) and message.get("type") == "cancel":
                 transfer_id = validate_cancel_message(message)
-                if self.active and transfer_id == self.active.transfer_id:
+                if self.active:
+                    if transfer_id != self.active.transfer_id:
+                        raise ProtocolError("another semantic transfer is active")
                     self.log(f"transfer {transfer_id} cancelled by host; received files remain in Downloads")
                     self.active = None
+                self.send({
+                    "type": "cancelled",
+                    "version": PROTOCOL_VERSION,
+                    "transferId": transfer_id,
+                })
                 return
 
             transfer_id, display, x, y, width, height, files = validate_drop_message(message)
@@ -409,8 +491,8 @@ class GuestHelper:
             transfer_id = None
             if isinstance(message, dict):
                 try:
-                    transfer_id = str(uuid.UUID(message.get("transferId")))
-                except (TypeError, ValueError):
+                    transfer_id = validate_transfer_id(message.get("transferId"))
+                except ProtocolError:
                     pass
             self.log(f"rejected control message: {error}")
             response = {"type": "error", "version": PROTOCOL_VERSION, "error": str(error)}
@@ -433,12 +515,15 @@ class GuestHelper:
                 self.log("rejected oversized control message")
                 continue
             try:
-                message = json.loads(raw.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                message = decode_control_message(raw)
+            except (UnicodeDecodeError, ValueError, RecursionError) as error:
                 self.log(f"invalid JSON: {error}")
                 self.send({"type": "error", "version": PROTOCOL_VERSION, "error": "invalid JSON"})
                 continue
             self.handle_message(message)
+        if len(self.read_buffer) >= MAX_MESSAGE_BYTES:
+            self.log("dropping oversized control message")
+            self.close_port()
 
     def scan_candidates(self, session: TransferSession, expected: ExpectedFile) -> list[tuple[Path, os.stat_result]]:
         matches = []
@@ -483,57 +568,301 @@ class GuestHelper:
             candidate = directory / duplicate_name(name, number)
         return candidate
 
-    def copy_exclusive(self, source: Path, destination: Path, source_stat: os.stat_result) -> None:
-        source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_stat.st_mode & 0o777)
+    def retire_copied_source(
+        self,
+        source: Path,
+        recovery: Path,
+        source_stat: os.stat_result,
+    ) -> None:
+        """Remove the staged inode without unlinking a pathname replacement.
+
+        Renaming first atomically captures whichever inode currently occupies
+        the staging pathname. If another writer replaced it during the copy,
+        preserve that file under the original Downloads name instead of
+        deleting it.
+        """
+        for _attempt in range(100):
+            retirement = source.with_name(f".utm-spice-dnd-{uuid.uuid4()}.retired")
             try:
-                with os.fdopen(source_fd, "rb", closefd=False) as source_file, os.fdopen(destination_fd, "wb", closefd=False) as destination_file:
-                    shutil.copyfileobj(source_file, destination_file, 1024 * 1024)
-                    destination_file.flush()
-                    os.fsync(destination_fd)
-            except Exception:
+                rename_no_replace(source, retirement)
+                break
+            except FileExistsError:
+                continue
+            except FileNotFoundError:
+                self.log(f"staged source disappeared before cleanup: {source}")
+                return
+            except OSError as error:
+                self.log(f"copied staging file retained for recovery at {source}: {error}")
+                return
+        else:
+            self.log(f"copied staging file retained for recovery at {source}: name collisions")
+            return
+
+        try:
+            retired_stat = retirement.lstat()
+        except OSError as error:
+            self.log(f"copied staging file retained for recovery at {retirement}: {error}")
+            return
+        retired_identity = (retired_stat.st_dev, retired_stat.st_ino)
+        expected_identity = (source_stat.st_dev, source_stat.st_ino)
+        if not stat.S_ISREG(retired_stat.st_mode) or retired_identity != expected_identity:
+            try:
+                restored = self.restore_staged_source(retirement, recovery)
+                self.log(f"preserved staging pathname replacement at {restored}")
+            except ProtocolError as error:
+                self.log(str(error))
+            return
+
+        try:
+            retirement.unlink()
+        except OSError as error:
+            self.log(f"copied staging file retained for recovery at {retirement}: {error}")
+
+    def cleanup_private_copy(
+        self,
+        workspace: Path,
+        temporary: Path,
+        temporary_stat: Optional[os.stat_result],
+    ) -> None:
+        if temporary_stat is not None:
+            try:
+                current_stat = temporary.lstat()
+                expected_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+                current_identity = (current_stat.st_dev, current_stat.st_ino)
+                if stat.S_ISREG(current_stat.st_mode) and current_identity == expected_identity:
+                    temporary.unlink()
+                else:
+                    self.log(f"private copy pathname replacement retained at {temporary}")
+            except FileNotFoundError:
+                pass
+        try:
+            workspace.rmdir()
+        except OSError:
+            pass
+
+    def retract_unverified_destination(self, destination: Path) -> None:
+        """Atomically remove an unverified publication without deleting it.
+
+        Another process can replace a pathname between publication and the
+        identity check. Capture whichever inode is currently there under a
+        recovery name instead of unlinking a possibly unrelated file.
+        """
+        for _attempt in range(100):
+            recovery = destination.with_name(f".utm-spice-dnd-{uuid.uuid4()}.unverified")
+            try:
+                rename_no_replace(destination, recovery)
+                self.log(f"unverified published file retained for recovery at {recovery}")
+                return
+            except FileExistsError:
+                continue
+            except FileNotFoundError:
+                self.log(f"unverified published file disappeared before retraction: {destination}")
+                return
+            except OSError as error:
+                self.log(f"could not retract unverified published file at {destination}: {error}")
+                return
+        self.log(f"could not retract unverified published file at {destination}: name collisions")
+
+    def verify_published_destination(
+        self,
+        destination: Path,
+        expected_stat: os.stat_result,
+    ) -> None:
+        try:
+            published_stat = destination.lstat()
+        except OSError as error:
+            raise ProtocolError(f"published file could not be verified: {error}") from error
+        if (
+            not stat.S_ISREG(published_stat.st_mode)
+            or (published_stat.st_dev, published_stat.st_ino)
+            != (expected_stat.st_dev, expected_stat.st_ino)
+        ):
+            self.retract_unverified_destination(destination)
+            raise ProtocolError("published file identity changed before verification")
+
+    def copy_exclusive(
+        self,
+        source: Path,
+        destination_directory: Path,
+        destination_name: str,
+        source_stat: os.stat_result,
+        recovery: Path,
+    ) -> Path:
+        for _attempt in range(100):
+            workspace = destination_directory / f".utm-spice-dnd-{uuid.uuid4()}.copy"
+            try:
+                workspace.mkdir(mode=0o700)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise ProtocolError("could not create a private copy workspace")
+
+        temporary = workspace / "payload"
+        temporary_stat: Optional[os.stat_result] = None
+        try:
+            source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            try:
+                opened_stat = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or (opened_stat.st_dev, opened_stat.st_ino)
+                    != (source_stat.st_dev, source_stat.st_ino)
+                    or opened_stat.st_size != source_stat.st_size
+                ):
+                    raise ProtocolError("received source changed before it could be copied")
+                destination_fd = os.open(
+                    temporary,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    source_stat.st_mode & 0o777,
+                )
                 try:
-                    destination.unlink()
-                except OSError:
-                    pass
-                raise
+                    temporary_stat = os.fstat(destination_fd)
+                    with os.fdopen(source_fd, "rb", closefd=False) as source_file, os.fdopen(destination_fd, "wb", closefd=False) as destination_file:
+                        shutil.copyfileobj(source_file, destination_file, 1024 * 1024)
+                        destination_file.flush()
+                        os.fsync(destination_fd)
+                    completed_stat = os.fstat(source_fd)
+                    if (
+                        completed_stat.st_size != opened_stat.st_size
+                        or completed_stat.st_mtime_ns != opened_stat.st_mtime_ns
+                    ):
+                        raise ProtocolError("received source changed while it was copied")
+                finally:
+                    os.close(destination_fd)
             finally:
-                os.close(destination_fd)
-        finally:
-            os.close(source_fd)
-        source.unlink()
+                os.close(source_fd)
+        except BaseException:
+            self.cleanup_private_copy(workspace, temporary, temporary_stat)
+            raise
+
+        try:
+            copied_stat = temporary.lstat()
+            if temporary_stat is None or (
+                not stat.S_ISREG(copied_stat.st_mode)
+                or (copied_stat.st_dev, copied_stat.st_ino)
+                != (temporary_stat.st_dev, temporary_stat.st_ino)
+            ):
+                raise ProtocolError(f"private copy retained for recovery at {temporary}")
+
+            for number in range(0, 10000):
+                name = destination_name if number == 0 else duplicate_name(destination_name, number)
+                destination = destination_directory / name
+                try:
+                    rename_no_replace(temporary, destination)
+                    self.verify_published_destination(destination, temporary_stat)
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise ProtocolError("could not choose a non-colliding destination name")
+
+            try:
+                workspace.rmdir()
+            except OSError as error:
+                self.log(f"private copy workspace retained at {workspace}: {error}")
+            self.retire_copied_source(source, recovery, source_stat)
+            return destination
+        except BaseException:
+            self.cleanup_private_copy(workspace, temporary, temporary_stat)
+            raise
+
+    def stage_source(self, source: Path, source_stat: os.stat_result) -> Path:
+        staging = source.with_name(f".utm-spice-dnd-{uuid.uuid4()}.stage")
+        rename_no_replace(source, staging)
+        staged_stat = staging.lstat()
+        if (
+            not stat.S_ISREG(staged_stat.st_mode)
+            or (staged_stat.st_dev, staged_stat.st_ino)
+            != (source_stat.st_dev, source_stat.st_ino)
+            or staged_stat.st_size != source_stat.st_size
+        ):
+            self.restore_staged_source(staging, source)
+            raise ProtocolError("received source changed before it could be staged")
+        return staging
+
+    def restore_staged_source(self, staging: Path, original: Path) -> Path:
+        for number in range(0, 10000):
+            name = original.name if number == 0 else duplicate_name(original.name, number)
+            recovery = original.with_name(name)
+            try:
+                rename_no_replace(staging, recovery)
+                return recovery
+            except FileExistsError:
+                continue
+        raise ProtocolError(f"staged file retained for recovery at {staging}")
 
     def move_safely(
         self,
         source: Path,
         destination_directory: Path,
         destination_name: str,
+        expected_stat: Optional[os.stat_result] = None,
     ) -> Path:
         source_stat = source.lstat()
         if not stat.S_ISREG(source_stat.st_mode):
             raise ProtocolError("received source is no longer a regular file")
+        if expected_stat is not None and (
+            source_stat.st_dev, source_stat.st_ino, source_stat.st_size, source_stat.st_mtime_ns
+        ) != (
+            expected_stat.st_dev, expected_stat.st_ino, expected_stat.st_size, expected_stat.st_mtime_ns
+        ):
+            raise ProtocolError("received source changed after candidate scan")
 
         destination_directory, _ = self.resolver._validate_path(destination_directory, {})
         if destination_directory == self.downloads:
             return source
 
-        for number in range(0, 10000):
-            name = destination_name if number == 0 else duplicate_name(destination_name, number)
-            destination = destination_directory / name
+        staging = self.stage_source(source, source_stat)
+
+        try:
+            staging_fd = os.open(
+                staging,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+            )
             try:
-                os.link(source, destination, follow_symlinks=False)
-                source.unlink()
-                return destination
-            except FileExistsError:
-                continue
-            except OSError as error:
-                if error.errno != errno.EXDEV:
-                    raise
-                destination = self.safe_destination_path(destination_directory, destination_name)
-                self.copy_exclusive(source, destination, source_stat)
-                return destination
-        raise ProtocolError("could not choose a non-colliding destination name")
+                opened_stat = os.fstat(staging_fd)
+                if (
+                    not stat.S_ISREG(opened_stat.st_mode)
+                    or (opened_stat.st_dev, opened_stat.st_ino)
+                    != (source_stat.st_dev, source_stat.st_ino)
+                    or opened_stat.st_size != source_stat.st_size
+                ):
+                    raise ProtocolError("received source changed before publication")
+
+                for number in range(0, 10000):
+                    name = destination_name if number == 0 else duplicate_name(destination_name, number)
+                    destination = destination_directory / name
+                    try:
+                        # Link the already verified open inode, not the staging
+                        # pathname, which another process can swap after lstat.
+                        os.link(
+                            f"/proc/self/fd/{staging_fd}",
+                            destination,
+                            follow_symlinks=True,
+                        )
+                        self.verify_published_destination(destination, opened_stat)
+                        self.retire_copied_source(staging, source, source_stat)
+                        return destination
+                    except FileExistsError:
+                        continue
+                    except OSError as error:
+                        if error.errno != errno.EXDEV:
+                            raise
+                        return self.copy_exclusive(
+                            staging,
+                            destination_directory,
+                            destination_name,
+                            source_stat,
+                            source,
+                        )
+            finally:
+                os.close(staging_fd)
+            raise ProtocolError("could not choose a non-colliding destination name")
+        except BaseException:
+            if staging.exists() or staging.is_symlink():
+                self.restore_staged_source(staging, source)
+            raise
 
     def tick_transfer(self) -> None:
         session = self.active
@@ -559,7 +888,7 @@ class GuestHelper:
                 continue
             identity = (info.st_dev, info.st_ino)
             try:
-                destination = self.move_safely(source, session.destination, expected.name)
+                destination = self.move_safely(source, session.destination, expected.name, info)
             except (OSError, ProtocolError) as error:
                 self.log(f"target move failed for {source.name}: {error}; leaving file in Downloads")
                 destination = source
@@ -580,8 +909,6 @@ class GuestHelper:
                 "type": "complete",
                 "version": PROTOCOL_VERSION,
                 "transferId": session.transfer_id,
-                "target": session.target,
-                "files": session.moved,
             })
             self.log(f"transfer {session.transfer_id} complete")
             self.active = None
@@ -621,12 +948,14 @@ class GuestHelper:
                 continue
             self.log("control port connected")
             self.run_connected()
+            if self.running:
+                time.sleep(PORT_RETRY_INTERVAL)
         self.close_port()
         return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="UTM target-aware drag-and-drop guest helper")
+    parser = argparse.ArgumentParser(description="Target-aware SPICE drag-and-drop guest helper")
     parser.add_argument("--port", type=Path, default=Path(DEFAULT_PORT))
     parser.add_argument("--debug", action="store_true", default=os.environ.get("UTM_DND_DEBUG") == "1")
     args = parser.parse_args()

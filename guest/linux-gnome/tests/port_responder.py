@@ -45,12 +45,47 @@ def read_line(fd: int) -> bytes:
     return bytes(line)
 
 
+def write_all(fd: int, payload: bytes) -> None:
+    os.set_blocking(fd, True)
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("control port write made no progress")
+        remaining = remaining[written:]
+
+
+def acknowledge_cancel(fd: int, transfer_id: object) -> None:
+    cancel = json.loads(read_line(fd).decode("utf-8"))
+    if cancel != {
+        "type": "cancel",
+        "version": 1,
+        "transferId": transfer_id,
+    }:
+        raise ValueError(f"unexpected cancellation barrier: {cancel!r}")
+    acknowledgement = (json.dumps({
+        "type": "cancelled",
+        "version": 1,
+        "transferId": transfer_id,
+    }, separators=(",", ":")) + "\n").encode()
+    write_all(fd, acknowledgement)
+    print("sent=cancelled", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("malformed-json", "wrong-version", "oversized", "no-reply"))
+    parser.add_argument(
+        "mode",
+        choices=("malformed-json", "wrong-version", "oversized", "timeout-ack", "no-reply"),
+    )
     parser.add_argument("--port", type=Path, default=DEFAULT_PORT)
     parser.add_argument("--hold-seconds", type=float, default=4.0)
+    parser.add_argument("--delay-seconds", type=float, default=5.5)
     args = parser.parse_args()
+    if not 0.0 <= args.hold_seconds <= 60.0:
+        parser.error("--hold-seconds must be between 0 and 60")
+    if not 0.0 <= args.delay_seconds <= 60.0:
+        parser.error("--delay-seconds must be between 0 and 60")
 
     fd = open_port(args.port)
     try:
@@ -70,16 +105,16 @@ def main() -> int:
             }, separators=(",", ":")) + "\n").encode()
         elif args.mode == "oversized":
             reply = b"x" * MAX_MESSAGE_BYTES + b"\n"
-        else:
+        elif args.mode in ("timeout-ack", "no-reply"):
             reply = b""
 
         if reply:
-            os.set_blocking(fd, True)
-            remaining = memoryview(reply)
-            while remaining:
-                written = os.write(fd, remaining)
-                remaining = remaining[written:]
+            write_all(fd, reply)
             print(f"sent={args.mode} bytes={len(reply)}", flush=True)
+            acknowledge_cancel(fd, transfer_id)
+        elif args.mode == "timeout-ack":
+            time.sleep(args.delay_seconds)
+            acknowledge_cancel(fd, transfer_id)
         time.sleep(args.hold_seconds)
     finally:
         os.close(fd)

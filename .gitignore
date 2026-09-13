@@ -1,7 +1,9 @@
 .build/
+.work/
 dist/
 .DS_Store
 __pycache__/
 *.py[cod]
 *.log
 .venv/
+.coverage

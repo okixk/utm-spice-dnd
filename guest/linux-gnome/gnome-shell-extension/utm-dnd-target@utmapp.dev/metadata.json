@@ -1,7 +1,7 @@
 {
   "uuid": "utm-dnd-target@utmapp.dev",
-  "name": "UTM DnD Target Inspector",
-  "description": "Semantic drop-target inspection for UTM",
+  "name": "SPICE DnD Target Inspector",
+  "description": "Frontend-neutral semantic SPICE drop-target inspection",
   "shell-version": ["50"],
   "version": 1
 }
