@@ -5,3 +5,6 @@ __pycache__/
 *.py[cod]
 *.log
 .venv/
+guest/windows/**/bin/
+guest/windows/**/obj/
+guest/windows/artifacts/

@@ -25,8 +25,18 @@ node --check guest/linux-gnome/gnome-shell-extension/utm-dnd-target@utmapp.dev/e
 bash -n guest/linux-gnome/install.sh guest/linux-gnome/uninstall.sh host/utm-macos/build.sh
 ```
 
+Windows ARM64 (use `win-x64` for x64):
+
+```powershell
+dotnet build guest/windows/src/UtmDndGuest/UtmDndGuest.csproj -c Release -r win-arm64 --self-contained true
+dotnet publish guest/windows/tests/UtmDndGuest.Tests/UtmDndGuest.Tests.csproj -c Release -r win-arm64 --self-contained true -p:PublishSingleFile=true -o artifacts/tests-win-arm64
+artifacts/tests-win-arm64/UtmDndGuest.Tests.exe
+```
+
+`tests/UtmDndGuest.PortFaultPeer` is a development-only interactive test peer for malformed-reply and connected-timeout fallback tests. It is not installed by `install.ps1`.
+
 The guest protocol uses strict version 1 schemas, a 64 KiB frame limit, bounded file count/name/size fields, no host-supplied destination path, and one active semantic transfer at a time.
 
 ## Live test model
 
-Use an Ubuntu GNOME guest with the helper installed and the dedicated port ACL active. Verify host logs and guest journal contain the same transfer ID, then verify final paths and SHA-256 hashes. Do not include VM disks, private logs, screenshots, SSH credentials, or compiled applications in commits.
+Use an Ubuntu GNOME guest or Windows interactive desktop with the matching helper installed. Verify host and guest logs contain the same transfer ID, then verify final paths and SHA-256 hashes. On Windows also exercise Explorer tabs, helper absence, malformed/timeout peers, reboot, and VDAgent cancellation. Do not include VM disks, private logs, screenshots, SSH credentials, or compiled applications in commits.

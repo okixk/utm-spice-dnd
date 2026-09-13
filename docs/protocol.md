@@ -8,15 +8,15 @@ UTM sends a `drop` message before starting the standard SPICE transfer:
 {"type":"drop","version":1,"transferId":"UUID","display":0,"x":640,"y":400,"framebufferWidth":1280,"framebufferHeight":800,"files":[{"name":"test.txt","size":1234}]}
 ```
 
-Coordinates are top-left-origin pixels in the selected SPICE framebuffer. The Shell extension converts these to GNOME logical stage coordinates using the monitor geometry.
+Coordinates are top-left-origin pixels in the selected SPICE framebuffer. Linux converts them to GNOME logical stage coordinates. The Per-Monitor-V2-aware Windows helper scales them into the selected monitor's physical screen rectangle before `WindowFromPoint`.
 
 The helper replies with `ready` only after target resolution and a baseline snapshot of Downloads:
 
 ```json
-{"type":"ready","version":1,"transferId":"UUID","target":{"kind":"nautilus","uri":"file:///home/user/Documents","confidence":"high"}}
+{"type":"ready","version":1,"transferId":"UUID","target":{"kind":"explorer","confidence":"high"}}
 ```
 
-UTM starts `spice_main_channel_file_copy_async()` only after `ready`. It may send `cancel` if the SPICE operation fails. The helper emits `complete` or `error` status messages for diagnostics.
+UTM starts `spice_main_channel_file_copy_async()` only after `ready`. It may send `cancel` if the SPICE operation fails. The helper emits `complete` or `error` status messages for diagnostics. Windows paths are never returned to the host; debug responses contain only non-sensitive target/window diagnostics.
 
 Host-provided paths are not accepted. Only basenames and sizes are metadata; the guest resolves and validates the destination.
 
