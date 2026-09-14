@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            gir1.2-gtk-3.0 \
+            python3-coverage \
+            python3-gi \
+            shellcheck
+
+      - name: Run Python tests with branch coverage
+        run: |
+          coverage erase
+          coverage run --branch \
+            --source=host/virt-manager-linux,guest/linux-gnome/guest \
+            -m unittest discover -s host/virt-manager-linux/tests
+          coverage run --append --branch \
+            --source=host/virt-manager-linux,guest/linux-gnome/guest \
+            -m unittest discover -s guest/linux-gnome/tests
+          coverage report --omit='*/tests/*' --fail-under=80
+
+      - name: Check Python and shell syntax
+        run: |
+          python3 -m py_compile \
+            host/virt-manager-linux/*.py \
+            host/virt-manager-linux/lib/*.py \
+            guest/linux-gnome/guest/*.py \
+            guest/linux-gnome/tests/*.py
+          node --check \
+            guest/linux-gnome/gnome-shell-extension/utm-dnd-target@utmapp.dev/extension.js
+          find host/virt-manager-linux guest/linux-gnome \
+            -type f -name '*.sh' -print0 | xargs -0 shellcheck
+
+      - name: Verify spice-gtk patch applies to pinned source
+        env:
+          ARCHIVE: spice-gtk_0.42.orig.tar.xz
+          SHA256: 9380117f1811ad1faa1812cb6602479b6290d4a0d8cc442d44427f7f6c0e7a58
+          URL: http://archive.ubuntu.com/ubuntu/pool/universe/s/spice-gtk/spice-gtk_0.42.orig.tar.xz
+        run: |
+          mkdir ci-source
+          curl --fail --location --proto '=http,https' --tlsv1.2 \
+            --output "ci-source/$ARCHIVE" "$URL"
+          printf '%s  %s\n' "$SHA256" "ci-source/$ARCHIVE" | sha256sum --check
+          tar -xf "ci-source/$ARCHIVE" -C ci-source
+          patch --dry-run -p1 -d ci-source/spice-gtk-0.42 \
+            < host/virt-manager-linux/patches/spice-gtk-0.42-semantic-dnd.patch
+
+      - name: Check patch whitespace
+        run: git diff --check

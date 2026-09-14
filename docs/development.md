@@ -27,6 +27,23 @@ bash -n guest/linux-gnome/install.sh guest/linux-gnome/uninstall.sh host/utm-mac
 
 The guest protocol uses strict version 1 schemas, a 64 KiB frame limit, bounded file count/name/size fields, no host-supplied destination path, and one active semantic transfer at a time.
 
+## Linux host automated checks
+
+Run the same Python coverage gate used by CI:
+
+```sh
+coverage erase
+coverage run --branch --source=host/virt-manager-linux,guest/linux-gnome/guest \
+  -m unittest discover -s host/virt-manager-linux/tests
+coverage run --append --branch --source=host/virt-manager-linux,guest/linux-gnome/guest \
+  -m unittest discover -s guest/linux-gnome/tests
+coverage report --omit='*/tests/*' --fail-under=80
+```
+
+CI also checks Python, JavaScript, and shell syntax, then dry-applies the Linux
+host patch to the checksum-pinned spice-gtk 0.42 source archive. These checks do
+not replace real desktop drag tests.
+
 ## Live test model
 
 Use an Ubuntu GNOME guest with the helper installed and the dedicated port ACL active. Verify host logs and guest journal contain the same transfer ID, then verify final paths and SHA-256 hashes. Do not include VM disks, private logs, screenshots, SSH credentials, or compiled applications in commits.

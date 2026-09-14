@@ -9,8 +9,8 @@ an API return alone was not accepted as success.
 The project checkout was
 `https://github.com/okixk/utm-spice-dnd.git`, branch
 `feature/virt-manager-qemu`, based on project commit
-`f23890a1df25a43d99a3d3c15409810feac93360`. The feature changes were not yet
-committed or pushed when this evidence was captured.
+`f23890a1df25a43d99a3d3c15409810feac93360`. The captured implementation was
+committed as `bd00069` and pushed to the feature branch without merging main.
 
 | Component | Tested version/base |
 | --- | --- |
@@ -157,8 +157,8 @@ domain XML.
    not exercised with a physical multi-monitor SPICE guest in this run.
 4. The VM XML controller has a small unavoidable check/define concurrency
    window; post-define semantic verification detects an unexpected result.
-5. The feature is currently a source-built development patch. No upstream PR,
-   commit, or remote branch was created as part of the evidence captured here.
+5. The feature remains a source-built development patch. No upstream PR was
+   submitted.
 
 The recommended upstream split is a generic cancellable/deferred drop API plus
 coordinate exposure in spice-gtk, with the frontend-neutral semantic policy as
