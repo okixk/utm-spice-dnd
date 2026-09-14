@@ -64,6 +64,26 @@ def rename_no_replace(source: Path, destination: Path) -> None:
         raise OSError(error, os.strerror(error), str(destination))
 
 
+def link_fd_no_replace(source_fd: int, destination: Path) -> None:
+    """Hard-link an opened inode without resolving an attacker-controlled path.
+
+    Python's ``os.link(..., follow_symlinks=True)`` does not reliably select
+    ``linkat(AT_SYMLINK_FOLLOW)`` on every supported Python/glibc combination.
+    Calling linkat directly makes the proc-fd reference follow the verified
+    descriptor while retaining the kernel's atomic EEXIST behavior.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = getattr(libc, "linkat", None)
+    if linkat is None:
+        raise OSError(errno.ENOSYS, "descriptor hard-link is unavailable")
+    linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    linkat.restype = ctypes.c_int
+    source = os.fsencode(f"/proc/self/fd/{source_fd}")
+    if linkat(-100, source, -100, os.fsencode(destination), 0x400) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(destination))
+
+
 def validate_transfer_id(value: Any) -> str:
     if not isinstance(value, str):
         raise ProtocolError("invalid transferId")
@@ -836,11 +856,7 @@ class GuestHelper:
                     try:
                         # Link the already verified open inode, not the staging
                         # pathname, which another process can swap after lstat.
-                        os.link(
-                            f"/proc/self/fd/{staging_fd}",
-                            destination,
-                            follow_symlinks=True,
-                        )
+                        link_fd_no_replace(staging_fd, destination)
                         self.verify_published_destination(destination, opened_stat)
                         self.retire_copied_source(staging, source, source_stat)
                         return destination

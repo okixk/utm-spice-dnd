@@ -128,7 +128,7 @@ class ProtocolTests(unittest.TestCase):
                 source.write_bytes(b"replacement")
                 raise PermissionError("destination unavailable")
 
-            with patch.object(MODULE.os, "link", side_effect=fail_move):
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=fail_move):
                 with self.assertRaises(PermissionError):
                     helper.move_safely(source, destination, source.name)
             self.assertEqual(source.read_bytes(), b"replacement")
@@ -366,16 +366,16 @@ class ProtocolTests(unittest.TestCase):
             helper.resolver = SimpleNamespace(_validate_path=lambda path, target: (path, target))
             helper.logs = []
             helper.log = helper.logs.append
-            real_link = MODULE.os.link
+            real_link = MODULE.link_fd_no_replace
             displaced_staging = root / "displaced-staging"
 
-            def link_then_replace(staging_reference, final, **kwargs):
-                real_link(staging_reference, final, **kwargs)
+            def link_then_replace(staging_fd, final):
+                real_link(staging_fd, final)
                 staging = next(downloads.glob(".utm-spice-dnd-*.stage"))
                 staging.rename(displaced_staging)
                 staging.write_bytes(b"replacement")
 
-            with patch.object(MODULE.os, "link", side_effect=link_then_replace):
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=link_then_replace):
                 moved = helper.move_safely(source, destination, "test.txt")
 
             self.assertEqual(moved.read_bytes(), b"original")
@@ -397,16 +397,16 @@ class ProtocolTests(unittest.TestCase):
             helper.resolver = SimpleNamespace(_validate_path=lambda path, target: (path, target))
             helper.logs = []
             helper.log = helper.logs.append
-            real_link = MODULE.os.link
+            real_link = MODULE.link_fd_no_replace
             displaced_staging = root / "displaced-staging"
 
-            def swap_before_link(staging_reference, final, **kwargs):
+            def swap_before_link(staging_fd, final):
                 staging = next(downloads.glob(".utm-spice-dnd-*.stage"))
                 staging.rename(displaced_staging)
                 staging.write_bytes(b"replacement")
-                return real_link(staging_reference, final, **kwargs)
+                return real_link(staging_fd, final)
 
-            with patch.object(MODULE.os, "link", side_effect=swap_before_link):
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=swap_before_link):
                 moved = helper.move_safely(source, destination, "test.txt")
 
             self.assertEqual(moved.read_bytes(), b"original")
@@ -438,7 +438,7 @@ class ProtocolTests(unittest.TestCase):
                 staging.write_bytes(b"replacement")
                 return real_copy(source_file, destination_file, length)
 
-            with patch.object(MODULE.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")), \
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=OSError(errno.EXDEV, "cross-device")), \
                  patch.object(MODULE.shutil, "copyfileobj", side_effect=replace_during_copy):
                 moved = helper.move_safely(source, destination, "test.txt")
 
@@ -461,7 +461,7 @@ class ProtocolTests(unittest.TestCase):
             helper.resolver = SimpleNamespace(_validate_path=lambda path, target: (path, target))
             helper.log = lambda _message: None
 
-            with patch.object(MODULE.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")):
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=OSError(errno.EXDEV, "cross-device")):
                 moved = helper.move_safely(source, destination, "test.txt")
 
             self.assertEqual(moved.read_bytes(), b"original")
@@ -490,7 +490,7 @@ class ProtocolTests(unittest.TestCase):
                 final.write_bytes(b"replacement")
                 return real_copy(source_file, destination_file, length)
 
-            with patch.object(MODULE.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")), \
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=OSError(errno.EXDEV, "cross-device")), \
                  patch.object(MODULE.shutil, "copyfileobj", side_effect=replace_final_during_copy):
                 moved = helper.move_safely(source, destination, "test.txt")
 
@@ -522,7 +522,7 @@ class ProtocolTests(unittest.TestCase):
                     rename_source.write_bytes(b"replacement")
                 return real_rename_no_replace(rename_source, rename_destination)
 
-            with patch.object(MODULE.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")), \
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=OSError(errno.EXDEV, "cross-device")), \
                  patch.object(MODULE, "rename_no_replace", side_effect=swap_before_publish):
                 with self.assertRaisesRegex(MODULE.ProtocolError, "published file identity changed"):
                     helper.move_safely(source, destination, "test.txt")
@@ -585,7 +585,7 @@ class ProtocolTests(unittest.TestCase):
                 temporary.write_bytes(b"replacement")
                 raise OSError("copy failed")
 
-            with patch.object(MODULE.os, "link", side_effect=OSError(errno.EXDEV, "cross-device")), \
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=OSError(errno.EXDEV, "cross-device")), \
                  patch.object(MODULE.shutil, "copyfileobj", side_effect=replace_temp_and_fail):
                 with self.assertRaisesRegex(OSError, "copy failed"):
                     helper.move_safely(source, destination, "test.txt")
