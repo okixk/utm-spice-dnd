@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install test dependencies
         run: |
@@ -26,14 +26,14 @@ jobs:
 
       - name: Run Python tests with branch coverage
         run: |
-          coverage erase
-          coverage run --branch \
+          python3 -m coverage erase
+          python3 -m coverage run --branch \
             --source=host/virt-manager-linux,guest/linux-gnome/guest \
             -m unittest discover -s host/virt-manager-linux/tests
-          coverage run --append --branch \
+          python3 -m coverage run --append --branch \
             --source=host/virt-manager-linux,guest/linux-gnome/guest \
             -m unittest discover -s guest/linux-gnome/tests
-          coverage report --omit='*/tests/*' --fail-under=80
+          python3 -m coverage report --omit='*/tests/*' --fail-under=80
 
       - name: Check Python and shell syntax
         run: |
