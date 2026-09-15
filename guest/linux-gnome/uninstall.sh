@@ -44,7 +44,7 @@ remove_project_udev_rule() {
             fi
             echo "uninstall.sh: warning: $rule_target changed concurrently; preserved prior file at $quarantine" >&2
         }
-        # shellcheck disable=SC2329
+        # shellcheck disable=SC2317,SC2329
         cleanup() {
             if [[ "$restore_needed" == true ]]; then
                 if [[ -e "$quarantine" ]] || [[ -L "$quarantine" ]]; then
@@ -117,7 +117,7 @@ remove_project_extension() {
             fi
             warn "$extension_dir changed concurrently; preserved prior extension at $quarantine"
         }
-        # shellcheck disable=SC2329
+        # shellcheck disable=SC2317,SC2329
         cleanup() {
             if [[ "$restore_needed" == true ]]; then
                 if [[ -e "$quarantine" ]] || [[ -L "$quarantine" ]]; then
