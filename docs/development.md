@@ -40,9 +40,11 @@ coverage run --append --branch --source=host/virt-manager-linux,guest/linux-gnom
 coverage report --omit='*/tests/*' --fail-under=80
 ```
 
-CI also checks Python, JavaScript, and shell syntax, then dry-applies the Linux
-host patch to the checksum-pinned spice-gtk 0.42 source archive. These checks do
-not replace real desktop drag tests.
+CI also checks Python, JavaScript, and shell syntax, applies the Linux host patch
+to the checksum-pinned spice-gtk 0.42 source archive, then builds and runs the
+14-case semantic DnD C state-machine suite. It also performs a complete patched
+spice-gtk Meson build and test run with optional features disabled, so widget
+integration is compiled. These checks do not replace real desktop drag tests.
 
 ## Live test model
 

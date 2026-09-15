@@ -26,6 +26,42 @@ fail() {
     exit 1
 }
 
+assert_unmounted_tree() {
+    directory=$1
+    if ! python3 - "$directory" <<'PY'
+import os
+import re
+import sys
+
+
+def decode_mount_path(field):
+    return re.sub(
+        rb"\\([0-7]{3})",
+        lambda match: bytes((int(match.group(1), 8),)),
+        field,
+    )
+
+
+root = os.fsencode(os.path.realpath(sys.argv[1]))
+prefix = root + (b"" if root == b"/" else b"/")
+
+try:
+    with open("/proc/self/mountinfo", "rb") as mountinfo:
+        for line in mountinfo:
+            fields = line.split(b" - ", 1)[0].split()
+            if len(fields) < 5:
+                raise ValueError("malformed mountinfo record")
+            mount_path = decode_mount_path(fields[4])
+            if mount_path == root or mount_path.startswith(prefix):
+                raise SystemExit(1)
+except (OSError, ValueError):
+    raise SystemExit(2)
+PY
+    then
+        fail "refusing mounted path or nested mount under: $directory"
+    fi
+}
+
 [ ! -L "$BUILD_ROOT" ] || fail "refusing symlinked build root: $BUILD_ROOT"
 mkdir -p "$BUILD_ROOT"
 SCRIPT_REAL=$(realpath -e "$SCRIPT_DIR")
@@ -33,9 +69,11 @@ BUILD_ROOT_REAL=$(realpath -e "$BUILD_ROOT")
 [ "$BUILD_ROOT_REAL" = "$SCRIPT_REAL/.build" ] || \
     fail "build root resolves outside the host development directory"
 
-for command in apt-get cc curl dpkg-architecture dpkg-deb meson ninja patch pkg-config sha256sum tar; do
+for command in apt-get cc curl dpkg-architecture dpkg-deb find meson ninja patch pkg-config python3 realpath sha256sum tar; do
     command -v "$command" >/dev/null 2>&1 || fail "required command is missing: $command"
 done
+
+assert_unmounted_tree "$BUILD_ROOT_REAL"
 
 case $(dpkg --print-architecture 2>/dev/null || true) in
     amd64) ;;
@@ -68,7 +106,8 @@ reset_dir() {
         "$BUILD_ROOT_REAL"/*) ;;
         *) fail "refusing to clear resolved path outside $BUILD_ROOT_REAL: $resolved" ;;
     esac
-    find "$resolved" -mindepth 1 -delete
+    assert_unmounted_tree "$resolved"
+    find "$resolved" -xdev -mindepth 1 -delete
 }
 
 # Ubuntu's runtime is left untouched. These packages are downloaded and

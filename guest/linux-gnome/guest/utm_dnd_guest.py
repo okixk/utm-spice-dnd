@@ -41,10 +41,40 @@ PORT_RETRY_INTERVAL = 1.0
 STABLE_INTERVAL = 0.60
 TRANSFER_TIMEOUT = 180.0
 PORT_WRITE_TIMEOUT = 3.0
+DESCRIPTOR_LINK_FALLBACK_ERRNOS = frozenset((
+    errno.EXDEV,
+    errno.EPERM,
+    errno.EOPNOTSUPP,
+    errno.ENOSYS,
+))
 
 
 class ProtocolError(ValueError):
     pass
+
+
+def safe_log_text(value: str) -> str:
+    """Return one printable journal field without changing protocol values."""
+    escapes = {
+        "\\": "\\\\",
+        "\b": "\\b",
+        "\t": "\\t",
+        "\n": "\\n",
+        "\f": "\\f",
+        "\r": "\\r",
+    }
+
+    def escape(character: str) -> str:
+        if character in escapes:
+            return escapes[character]
+        if character.isprintable():
+            return character
+        codepoint = ord(character)
+        width = 4 if codepoint <= 0xFFFF else 8
+        prefix = "u" if width == 4 else "U"
+        return f"\\{prefix}{codepoint:0{width}x}"
+
+    return "".join(escape(character) for character in value)
 
 
 def rename_no_replace(source: Path, destination: Path) -> None:
@@ -412,7 +442,7 @@ class GuestHelper:
         self.read_buffer = bytearray()
 
     def log(self, message: str) -> None:
-        print(f"utm-dnd-guest: {message}", flush=True)
+        print(f"utm-dnd-guest: {safe_log_text(message)}", flush=True)
 
     def send(self, message: dict[str, Any]) -> None:
         if self.fd is None:
@@ -863,7 +893,7 @@ class GuestHelper:
                     except FileExistsError:
                         continue
                     except OSError as error:
-                        if error.errno != errno.EXDEV:
+                        if error.errno not in DESCRIPTOR_LINK_FALLBACK_ERRNOS:
                             raise
                         return self.copy_exclusive(
                             staging,

@@ -54,11 +54,11 @@ The macOS integration was initially tested with UTM 4.7.5 on Apple Silicon and
 an Ubuntu ARM64 GNOME Wayland guest.
 
 The Linux integration targets Ubuntu 26.04.1, virt-manager 5.1.0, spice-gtk
-0.42, libvirt 12.0.0, and QEMU 10.2.1. Source inspection and libvirt/QEMU XML
-validation are complete. Real graphical file-manager drops, final guest path
-checks, SHA-256 comparisons, injected failure modes, and the virt-viewer run
-must be recorded before the Linux port is described as live-tested. Consult the
-current branch's test report rather than treating planned test cases as passes.
+0.42, libvirt 12.0.0, and QEMU 10.2.1. The feature branch has completed real
+graphical file-manager drops through virt-manager and virt-viewer, final guest
+path and SHA-256 verification, VM restart/reconnect, and injected failure-mode
+tests. See [the Linux live-test report](host/virt-manager-linux/LIVE-TEST.md)
+for the exact evidence and remaining limitations.
 
 This is not an official UTM, virt-manager, virt-viewer, spice-gtk, or libvirt
 release.

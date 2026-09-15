@@ -210,6 +210,9 @@ First disable each VM where the dedicated channel is no longer wanted. Then:
 ./host/virt-manager-linux/uninstall.sh
 ```
 
+The uninstaller refuses to traverse the isolated build tree when it contains a
+mount point. Unmount that tree first; unrelated mounted data is never removed.
+
 Uninstall removes only the isolated development build and launchers created by
 the installer. It does not remove distro packages or silently edit domains.
 Guest removal is separate:

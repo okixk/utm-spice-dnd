@@ -254,11 +254,13 @@ class FakeCommandRunner:
         self.state = state
         self.define_returncode = define_returncode
         self.calls = []
+        self.call_kwargs = []
         self.dump_count = 0
         self.defined_xml = None
 
     def __call__(self, command, **kwargs):
         self.calls.append(tuple(command))
+        self.call_kwargs.append(dict(kwargs))
         if "dumpxml" in command:
             self.dump_count += 1
             if self.dump_count == 2 and self.xml_after:
@@ -333,7 +335,187 @@ class ApplyTests(unittest.TestCase):
         self.assertGreaterEqual(runner.dump_count, 3)
         self.assertEqual(result.xml, runner.defined_xml)
 
-    def test_fsyncs_backup_candidate_and_directory_before_define(self):
+    def test_rejects_existing_backup_directory_accessible_to_other_users(self):
+        runner = FakeCommandRunner(BASE_XML)
+        with tempfile.TemporaryDirectory() as parent:
+            backup_dir = Path(parent) / "unsafe"
+            backup_dir.mkdir(mode=0o755)
+
+            with self.assertRaisesRegex(MODULE.ConfigurationError, "backup directory"):
+                MODULE.apply_to_domain(
+                    "test-vm", "enable", backup_dir, runner=runner
+                )
+
+            self.assertEqual(list(backup_dir.iterdir()), [])
+        self.assertFalse(any("define" in call for call in runner.calls))
+
+    def test_rejects_symlink_backup_directory(self):
+        runner = FakeCommandRunner(BASE_XML)
+        with tempfile.TemporaryDirectory() as parent:
+            target = Path(parent) / "private"
+            target.mkdir(mode=0o700)
+            backup_dir = Path(parent) / "backup-link"
+            backup_dir.symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(MODULE.ConfigurationError, "backup directory"):
+                MODULE.apply_to_domain(
+                    "test-vm", "enable", backup_dir, runner=runner
+                )
+
+            self.assertEqual(list(target.iterdir()), [])
+        self.assertFalse(any("define" in call for call in runner.calls))
+
+    def test_rejects_symlink_component_in_backup_directory_path(self):
+        runner = FakeCommandRunner(BASE_XML)
+        with tempfile.TemporaryDirectory() as parent:
+            real_parent = Path(parent) / "real"
+            backup_dir = real_parent / "backups"
+            backup_dir.mkdir(mode=0o700, parents=True)
+            linked_parent = Path(parent) / "linked"
+            linked_parent.symlink_to(real_parent, target_is_directory=True)
+
+            with self.assertRaisesRegex(MODULE.ConfigurationError, "backup directory"):
+                MODULE.apply_to_domain(
+                    "test-vm", "enable", linked_parent / "backups", runner=runner
+                )
+
+            self.assertEqual(list(backup_dir.iterdir()), [])
+        self.assertFalse(any("define" in call for call in runner.calls))
+
+    def test_rejects_non_sticky_group_or_world_writable_backup_ancestor(self):
+        with tempfile.TemporaryDirectory() as parent:
+            for mode in (0o720, 0o702):
+                with self.subTest(mode=oct(mode)):
+                    runner = FakeCommandRunner(BASE_XML)
+                    unsafe_parent = Path(parent) / f"shared-{mode:o}"
+                    unsafe_parent.mkdir(mode=mode)
+                    unsafe_parent.chmod(mode)
+                    backup_dir = unsafe_parent / "backups"
+                    backup_dir.mkdir(mode=0o700)
+
+                    with self.assertRaisesRegex(
+                        MODULE.ConfigurationError, "writable ancestor"
+                    ):
+                        MODULE.apply_to_domain(
+                            "test-vm", "enable", backup_dir, runner=runner
+                        )
+
+                    self.assertEqual(list(backup_dir.iterdir()), [])
+                    self.assertFalse(any("define" in call for call in runner.calls))
+
+    def test_allows_sticky_world_writable_backup_ancestor(self):
+        runner = FakeCommandRunner(BASE_XML)
+        with tempfile.TemporaryDirectory() as parent:
+            sticky_parent = Path(parent) / "sticky"
+            sticky_parent.mkdir(mode=0o1777)
+            sticky_parent.chmod(0o1777)
+            backup_dir = sticky_parent / "backups"
+
+            result = MODULE.apply_to_domain(
+                "test-vm", "enable", backup_dir, runner=runner
+            )
+
+            self.assertTrue(result.changed)
+            self.assertEqual(stat.S_IMODE(backup_dir.stat().st_mode), 0o700)
+            self.assertEqual(len(list(backup_dir.glob("*.xml"))), 1)
+
+    def test_restricts_legacy_default_project_state_directory(self):
+        runner = FakeCommandRunner(BASE_XML)
+        with tempfile.TemporaryDirectory() as parent, mock.patch.dict(
+            os.environ, {"XDG_STATE_HOME": str(Path(parent) / "state")}
+        ):
+            backup_dir = MODULE._default_backup_dir()
+            project_dir = backup_dir.parent
+            project_dir.parent.mkdir(mode=0o700, parents=True)
+            project_dir.mkdir(mode=0o775)
+            project_dir.chmod(0o775)
+
+            result = MODULE.apply_to_domain(
+                "test-vm", "enable", backup_dir, runner=runner
+            )
+
+            self.assertTrue(result.changed)
+            self.assertEqual(stat.S_IMODE(project_dir.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(backup_dir.stat().st_mode), 0o700)
+            self.assertEqual(len(list(backup_dir.glob("*.xml"))), 1)
+
+    def test_does_not_chmod_equivalent_legacy_arbitrary_backup_ancestor(self):
+        runner = FakeCommandRunner(BASE_XML)
+        with tempfile.TemporaryDirectory() as parent:
+            arbitrary_parent = Path(parent) / "arbitrary-project"
+            arbitrary_parent.mkdir(mode=0o775)
+            arbitrary_parent.chmod(0o775)
+            backup_dir = arbitrary_parent / "domain-backups"
+
+            with self.assertRaisesRegex(MODULE.ConfigurationError, "writable ancestor"):
+                MODULE.apply_to_domain(
+                    "test-vm", "enable", backup_dir, runner=runner
+                )
+
+            self.assertEqual(stat.S_IMODE(arbitrary_parent.stat().st_mode), 0o775)
+            self.assertFalse(backup_dir.exists())
+
+    def test_rejects_backup_directory_not_owned_by_current_user(self):
+        runner = FakeCommandRunner(BASE_XML)
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            MODULE.os, "geteuid", return_value=os.geteuid() + 1
+        ):
+            with self.assertRaisesRegex(MODULE.ConfigurationError, "backup directory"):
+                MODULE.apply_to_domain(
+                    "test-vm", "enable", Path(directory), runner=runner
+                )
+
+            self.assertEqual(list(Path(directory).iterdir()), [])
+        self.assertFalse(any("define" in call for call in runner.calls))
+
+    def test_hands_candidate_to_virsh_through_inherited_descriptor(self):
+        runner = FakeCommandRunner(BASE_XML)
+        with tempfile.TemporaryDirectory() as directory:
+            MODULE.apply_to_domain(
+                "test-vm", "enable", Path(directory), runner=runner
+            )
+
+            self.assertFalse(list(Path(directory).glob(".candidate-*")))
+
+        define_index = next(
+            index for index, call in enumerate(runner.calls) if "define" in call
+        )
+        define_call = runner.calls[define_index]
+        descriptor = int(define_call[-1].removeprefix("/proc/self/fd/"))
+        self.assertEqual(define_call[-1], f"/proc/self/fd/{descriptor}")
+        self.assertEqual(runner.call_kwargs[define_index]["pass_fds"], (descriptor,))
+
+    def test_refuses_replaced_backup_directory_before_define(self):
+        with tempfile.TemporaryDirectory() as parent:
+            backup_dir = Path(parent) / "backups"
+            moved_dir = Path(parent) / "moved-backups"
+
+            class ReplacingRunner(FakeCommandRunner):
+                def __init__(self, xml):
+                    super().__init__(xml)
+                    self.state_count = 0
+
+                def __call__(self, command, **kwargs):
+                    if "domstate" in command:
+                        self.state_count += 1
+                        if self.state_count == 3:
+                            backup_dir.rename(moved_dir)
+                            backup_dir.mkdir(mode=0o700)
+                    return super().__call__(command, **kwargs)
+
+            runner = ReplacingRunner(BASE_XML)
+            with self.assertRaisesRegex(
+                MODULE.ConfigurationError, "backup directory.*changed"
+            ):
+                MODULE.apply_to_domain(
+                    "test-vm", "enable", backup_dir, runner=runner
+                )
+
+            self.assertEqual(list(backup_dir.iterdir()), [])
+            self.assertEqual(len(list(moved_dir.glob("*.xml"))), 1)
+        self.assertFalse(any("define" in call for call in runner.calls))
+
+    def test_fsyncs_backup_anonymous_candidate_and_directory_before_define(self):
         events = []
 
         class OrderedRunner(FakeCommandRunner):
@@ -357,8 +539,7 @@ class ApplyTests(unittest.TestCase):
         define_index = events.index("define")
         durable_events = events[:define_index]
         self.assertGreaterEqual(durable_events.count("fsync-file"), 2)
-        self.assertGreaterEqual(durable_events.count("fsync-directory"), 2)
-        self.assertEqual(durable_events[-1], "fsync-directory")
+        self.assertGreaterEqual(durable_events.count("fsync-directory"), 1)
 
     def test_define_failure_reports_backup_for_manual_recovery(self):
         runner = FakeCommandRunner(BASE_XML, define_returncode=1)

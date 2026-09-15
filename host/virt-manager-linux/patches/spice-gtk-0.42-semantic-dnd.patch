@@ -779,8 +779,8 @@ diff -ruN a/src/spice-widget.c b/src/spice-widget.c
 +            !semantic_file_name_valid(name) ||
 +            g_file_info_get_size(info) > G_MAXINT64) {
 +            g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
-+                        "'%s' is not a readable regular file with a valid name",
-+                        name != NULL ? name : "(invalid)");
++                        "dropped item %d is not a readable regular file with a valid name",
++                        i + 1);
 +            g_free(name);
 +            g_object_unref(info);
 +            semantic_drop_free(drop);

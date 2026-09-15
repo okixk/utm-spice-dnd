@@ -5,6 +5,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 helper_source="$script_dir/guest/utm_dnd_guest.py"
 extension_source="$script_dir/gnome-shell-extension/utm-dnd-target@utmapp.dev"
 rule_source="$script_dir/install/70-utm-dnd.rules"
+rule_target=/etc/udev/rules.d/70-utm-dnd.rules
 service_source="$script_dir/install/utm-dnd-guest.service"
 extension_id=utm-dnd-target@utmapp.dev
 
@@ -14,6 +15,58 @@ fail() {
 }
 warn() {
     echo "install.sh: warning: $*" >&2
+}
+
+install_udev_rule() {
+    local rule_snapshot sentinel
+    sentinel=$'\037'
+    rule_snapshot=$(cat -- "$rule_source" && printf '%s' "$sentinel") \
+        || fail "could not read udev rule source"
+    [[ "$rule_snapshot" == *"$sentinel" ]] \
+        || fail "could not snapshot udev rule source"
+    rule_snapshot=${rule_snapshot%"$sentinel"}
+
+    printf '%s' "$rule_snapshot" | \
+    sudo bash -eu -o pipefail -c '
+        rule_target=$1
+        rule_directory=${rule_target%/*}
+        temporary=$(mktemp -- "$rule_directory/.70-utm-dnd.rules.XXXXXX")
+        trap '\''rm -f -- "$temporary"'\'' EXIT
+        cat > "$temporary"
+        chmod 0644 -- "$temporary"
+
+        if [[ -L "$rule_target" ]]; then
+            echo "install.sh: refusing to replace symbolic link: $rule_target" >&2
+            exit 73
+        fi
+        if [[ -e "$rule_target" ]]; then
+            if [[ ! -f "$rule_target" ]] || ! cmp -s -- "$temporary" "$rule_target"; then
+                echo "install.sh: refusing to overwrite $rule_target: existing file has different content" >&2
+                exit 73
+            fi
+            metadata=$(stat -Lc "%u:%g:%a" -- "$rule_target")
+            if [[ "$metadata" != "0:0:644" ]]; then
+                echo "install.sh: refusing existing $rule_target: expected root:root ownership and mode 0644; found untrusted ownership or mode $metadata" >&2
+                exit 73
+            fi
+            exit 0
+        fi
+
+        if ln -T -- "$temporary" "$rule_target" 2>/dev/null; then
+            exit 0
+        fi
+        if [[ ! -L "$rule_target" ]] && [[ -f "$rule_target" ]] \
+                && cmp -s -- "$temporary" "$rule_target"; then
+            metadata=$(stat -Lc "%u:%g:%a" -- "$rule_target")
+            if [[ "$metadata" == "0:0:644" ]]; then
+                exit 0
+            fi
+            echo "install.sh: refusing existing $rule_target: expected root:root ownership and mode 0644; found untrusted ownership or mode $metadata" >&2
+            exit 73
+        fi
+        echo "install.sh: refusing to overwrite $rule_target: destination appeared during installation" >&2
+        exit 73
+    ' install-utm-dnd-rule "$rule_target"
 }
 
 [[ "$(uname -s)" == "Linux" ]] || fail "Linux is required"
@@ -38,7 +91,7 @@ mkdir -p "$HOME/.local/share/gnome-shell/extensions/$extension_id"
 install -m644 "$extension_source/extension.js" "$HOME/.local/share/gnome-shell/extensions/$extension_id/extension.js"
 install -m644 "$extension_source/metadata.json" "$HOME/.local/share/gnome-shell/extensions/$extension_id/metadata.json"
 
-sudo install -o root -g root -m 0644 "$rule_source" /etc/udev/rules.d/70-utm-dnd.rules
+install_udev_rule
 sudo udevadm control --reload-rules
 
 systemctl --user daemon-reload

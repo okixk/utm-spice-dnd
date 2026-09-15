@@ -59,6 +59,22 @@ class ProtocolTests(unittest.TestCase):
         result = MODULE.validate_drop_message(self.valid_message())
         self.assertEqual(result[-1][0], MODULE.ExpectedFile("hello world.txt", 12))
 
+    def test_log_escapes_control_characters_in_valid_filename(self):
+        filename = "report\\literal\nforged\t\x1b[31m\x7f\u0085\u2028.txt"
+        self.assertEqual(MODULE.validate_basename(filename), filename)
+        helper = object.__new__(MODULE.GuestHelper)
+
+        with patch("builtins.print") as output:
+            helper.log(f"received={filename}")
+
+        output.assert_called_once_with(
+            "utm-dnd-guest: received=report\\\\literal\\nforged\\t\\u001b[31m"
+            "\\u007f\\u0085\\u2028.txt",
+            flush=True,
+        )
+        rendered = output.call_args.args[0]
+        self.assertTrue(all(character.isprintable() for character in rendered))
+
     def test_rejects_non_string_uuid_surrogates_and_huge_coordinates(self):
         for key, value in (("transferId", 3), ("transferId", []), ("x", 10 ** 400)):
             with self.subTest(key=key, value=str(value)[:20]):
@@ -467,6 +483,55 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(moved.read_bytes(), b"original")
             self.assertFalse(source.exists())
             self.assertEqual(list(downloads.iterdir()), [])
+
+    def test_descriptor_link_capability_errors_use_exclusive_copy(self):
+        for error_number in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS):
+            with self.subTest(error_number=error_number), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                downloads = root / "Downloads"
+                destination = root / "Documents"
+                downloads.mkdir()
+                destination.mkdir()
+                source = downloads / "test.txt"
+                source.write_bytes(b"original")
+                helper = object.__new__(MODULE.GuestHelper)
+                helper.downloads = downloads
+                helper.resolver = SimpleNamespace(_validate_path=lambda path, target: (path, target))
+                helper.log = lambda _message: None
+
+                with patch.object(
+                    MODULE,
+                    "link_fd_no_replace",
+                    side_effect=OSError(error_number, os.strerror(error_number)),
+                ), patch.object(helper, "copy_exclusive", wraps=helper.copy_exclusive) as copy_exclusive:
+                    moved = helper.move_safely(source, destination, "test.txt")
+
+                copy_exclusive.assert_called_once()
+                self.assertEqual(moved.read_bytes(), b"original")
+                self.assertFalse(source.exists())
+
+    def test_descriptor_link_non_capability_error_fails_closed(self):
+        helper = object.__new__(MODULE.GuestHelper)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            downloads = root / "Downloads"
+            destination = root / "Documents"
+            downloads.mkdir()
+            destination.mkdir()
+            source = downloads / "test.txt"
+            source.write_bytes(b"original")
+            helper.downloads = downloads
+            helper.resolver = SimpleNamespace(_validate_path=lambda path, target: (path, target))
+            helper.log = lambda _message: None
+
+            with patch.object(MODULE, "link_fd_no_replace", side_effect=OSError(errno.EIO, "I/O error")), \
+                 patch.object(helper, "copy_exclusive", wraps=helper.copy_exclusive) as copy_exclusive:
+                with self.assertRaisesRegex(OSError, "I/O error"):
+                    helper.move_safely(source, destination, "test.txt")
+
+            copy_exclusive.assert_not_called()
+            self.assertEqual(source.read_bytes(), b"original")
+            self.assertEqual(list(destination.iterdir()), [])
 
     def test_cross_filesystem_copy_does_not_publish_over_destination_replacement(self):
         helper = object.__new__(MODULE.GuestHelper)

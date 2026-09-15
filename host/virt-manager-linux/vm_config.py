@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import copy
 import difflib
+import errno
 import hashlib
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -445,11 +447,109 @@ def _safe_backup_name(original: str, domain: str) -> str:
     return f"{identity}-{timestamp}.xml"
 
 
-def _write_private_file(path: Path, contents: str) -> None:
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    return flags
+
+
+def _validate_backup_ancestor(metadata: os.stat_result, path: Path) -> None:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ConfigurationError(f"backup directory ancestor {path} is not a directory")
+    if metadata.st_uid not in {0, os.geteuid()}:
+        raise ConfigurationError(
+            f"backup directory ancestor {path} must be owned by root or the current user"
+        )
+    if mode & 0o022 and not mode & stat.S_ISVTX:
+        raise ConfigurationError(
+            f"backup directory has writable ancestor {path} without the sticky bit"
+        )
+
+
+def _validate_private_backup_directory(metadata: os.stat_result, path: Path) -> None:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or mode & 0o077
+    ):
+        raise ConfigurationError(
+            f"backup directory {path} must be owned by the current user and have "
+            "no group or other permissions"
+        )
+
+
+def _open_private_directory(
+    path: Path, *, create: bool = False, restrict_owned_final: bool = False
+) -> int:
+    """Walk and pin a private directory without following any symlinks."""
+    if not path.is_absolute():
+        raise ConfigurationError("backup directory path must be absolute")
+
+    flags = _directory_open_flags()
+    descriptor = os.open("/", flags)
+    walked = Path("/")
+    try:
+        for component in path.parts[1:]:
+            _validate_backup_ancestor(os.fstat(descriptor), walked)
+            walked = walked / component
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise ConfigurationError(
+                        f"backup directory {path} changed or disappeared"
+                    ) from None
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except OSError as error:
+                    raise ConfigurationError(
+                        f"could not securely create backup directory {walked}: {error}"
+                    ) from error
+            except OSError as error:
+                detail = (
+                    "contains a symlink"
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR}
+                    else str(error)
+                )
+                raise ConfigurationError(
+                    f"backup directory {path} is unsafe: {detail}"
+                ) from error
+            os.close(descriptor)
+            descriptor = child
+
+        metadata = os.fstat(descriptor)
+        if restrict_owned_final:
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid():
+                raise ConfigurationError(
+                    f"backup directory {path} must be a real directory owned by "
+                    "the current user"
+                )
+            if stat.S_IMODE(metadata.st_mode) != 0o700:
+                os.fchmod(descriptor, 0o700)
+                os.fsync(descriptor)
+                metadata = os.fstat(descriptor)
+        _validate_private_backup_directory(metadata, path)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _write_private_file(directory_fd: int, name: str, contents: str) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(path, flags, 0o600)
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(contents)
@@ -457,22 +557,49 @@ def _write_private_file(path: Path, contents: str) -> None:
             os.fsync(stream.fileno())
     except BaseException:
         try:
-            path.unlink()
+            os.unlink(name, dir_fd=directory_fd)
         except FileNotFoundError:
             pass
         raise
 
 
-def _fsync_directory(path: Path) -> None:
-    """Persist directory-entry changes before a candidate is handed to virsh."""
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    descriptor = os.open(path, flags)
+def _require_directory_path_unchanged(path: Path, pinned_descriptor: int) -> None:
+    """Ensure a reported backup path still names the pinned directory."""
     try:
-        os.fsync(descriptor)
+        current_descriptor = _open_private_directory(path)
+    except ConfigurationError as error:
+        raise ConfigurationError(
+            f"backup directory {path} changed after the backup was written; "
+            "no domain change was applied"
+        ) from error
+    try:
+        pinned = os.fstat(pinned_descriptor)
+        current = os.fstat(current_descriptor)
+        if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+            raise ConfigurationError(
+                f"backup directory {path} changed after the backup was written; "
+                "no domain change was applied"
+            )
     finally:
-        os.close(descriptor)
+        os.close(current_descriptor)
+
+
+def _fsync_directory(descriptor: int) -> None:
+    """Persist directory-entry changes before handing XML to virsh."""
+    os.fsync(descriptor)
+
+
+def _migrate_default_project_directory(backup_dir: Path) -> None:
+    """Restrict legacy default project state permissions, never custom paths."""
+    default_backup_dir = Path(os.path.abspath(_default_backup_dir().expanduser()))
+    if backup_dir != default_backup_dir:
+        return
+    descriptor = _open_private_directory(
+        backup_dir.parent,
+        create=True,
+        restrict_owned_final=True,
+    )
+    os.close(descriptor)
 
 
 def _require_powered_off(state: str, domain: str, phase: str) -> None:
@@ -541,70 +668,68 @@ def apply_to_domain(
     except ConfigurationError as error:
         raise ConfigurationError(f"{error}; no change was applied") from error
 
-    backup_dir = backup_dir.expanduser()
-    backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    backup_path = backup_dir / _safe_backup_name(original, domain)
-    _write_private_file(backup_path, original)
-    _fsync_directory(backup_dir)
-
-    candidate_path: Optional[Path] = None
+    backup_dir = Path(os.path.abspath(backup_dir.expanduser()))
+    _migrate_default_project_directory(backup_dir)
+    backup_directory_fd = _open_private_directory(backup_dir, create=True)
+    backup_name = _safe_backup_name(original, domain)
+    backup_path = backup_dir / backup_name
     try:
-        descriptor, candidate_name = tempfile.mkstemp(
-            prefix=".candidate-", suffix=".xml", dir=backup_dir
-        )
-        candidate_path = Path(candidate_name)
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+        _write_private_file(backup_directory_fd, backup_name, original)
+        _fsync_directory(backup_directory_fd)
+
+        # Keep candidate anonymous and refer to its inherited descriptor. This
+        # prevents another process from replacing path contents between final
+        # checks and virsh opening the XML.
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
             stream.write(change.xml)
             stream.flush()
             os.fsync(stream.fileno())
-        _fsync_directory(backup_dir)
+            stream.seek(0)
 
-        # Recheck after the durable files are prepared so the unavoidable
-        # dumpxml/define race is limited to the final virsh calls, rather than
-        # also spanning backup and candidate I/O.
-        latest = _run_checked(
-            runner,
-            [*prefix, "dumpxml", "--inactive", domain],
-            f"perform final inactive XML check for domain {domain!r}",
-        ).stdout
-        if latest != original:
-            raise ConfigurationError(
-                f"inactive XML for domain {domain!r} changed concurrently; no domain "
-                f"change was applied, and the original backup remains at {backup_path}"
-            )
-        latest_state = _run_checked(
-            runner,
-            [*prefix, "domstate", domain, "--reason"],
-            f"perform final state check for domain {domain!r}",
-        ).stdout.strip()
-        try:
-            _require_powered_off(latest_state, domain, "final pre-define")
-        except ConfigurationError as error:
-            raise ConfigurationError(
-                f"{error}; no domain change was applied, and the original backup "
-                f"remains at {backup_path}"
-            ) from error
-
-        result = runner(
-            [*prefix, "define", "--validate", str(candidate_path)],
-            check=False,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "LC_ALL": "C"},
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "unknown error").strip()
-            raise ConfigurationError(
-                f"failed to validate and define domain {domain!r}: {detail}; "
-                f"backup remains at {backup_path}"
-            )
-    finally:
-        if candidate_path is not None:
+            # Recheck after durable backup/candidate preparation so the
+            # unavoidable dumpxml/define race spans only final virsh calls.
+            latest = _run_checked(
+                runner,
+                [*prefix, "dumpxml", "--inactive", domain],
+                f"perform final inactive XML check for domain {domain!r}",
+            ).stdout
+            if latest != original:
+                raise ConfigurationError(
+                    f"inactive XML for domain {domain!r} changed concurrently; no domain "
+                    f"change was applied, and the original backup remains at {backup_path}"
+                )
+            latest_state = _run_checked(
+                runner,
+                [*prefix, "domstate", domain, "--reason"],
+                f"perform final state check for domain {domain!r}",
+            ).stdout.strip()
             try:
-                candidate_path.unlink()
-            except FileNotFoundError:
-                pass
+                _require_powered_off(latest_state, domain, "final pre-define")
+            except ConfigurationError as error:
+                raise ConfigurationError(
+                    f"{error}; no domain change was applied, and the original backup "
+                    f"remains at {backup_path}"
+                ) from error
+
+            _require_directory_path_unchanged(backup_dir, backup_directory_fd)
+            descriptor = stream.fileno()
+            result = runner(
+                [*prefix, "define", "--validate", f"/proc/self/fd/{descriptor}"],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "LC_ALL": "C"},
+                pass_fds=(descriptor,),
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout or "unknown error").strip()
+                raise ConfigurationError(
+                    f"failed to validate and define domain {domain!r}: {detail}; "
+                    f"backup remains at {backup_path}"
+                )
+    finally:
+        os.close(backup_directory_fd)
 
     persisted = _run_checked(
         runner,

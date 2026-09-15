@@ -1,6 +1,7 @@
 # Linux host live-test report
 
-This report records the development-host run on 2026-09-09 and 2026-09-12.
+This report records development-host runs on 2026-09-09, 2026-09-12, and
+2026-09-14.
 All drag cases below used real Nautilus pointer drags into graphical consoles;
 an API return alone was not accepted as success.
 
@@ -83,7 +84,7 @@ coordinates together with display ID and framebuffer dimensions. Unit cases
 cover exact scaling, letterbox rejection, HiDPI-equivalent ratios, scrolling,
 fullscreen-sized allocations, bounds, and non-zero monitor origins.
 
-Protocol v1 sends one length-prefixed JSON `drop` frame (maximum 64 KiB) with a
+Protocol v1 sends one newline-delimited JSON `drop` frame (maximum 64 KiB) with a
 UUID transfer ID, mapped display geometry, and validated file basenames/sizes.
 Only a strict matching `ready` releases the ordinary SPICE file transfer. The
 guest returns a compact matching `complete` after it has safely placed all
@@ -123,11 +124,31 @@ for virt-viewer.
 
 ## Automated verification
 
-- Host Python suite: 57 passed.
-- Guest Python suite: 59 passed.
-- Combined measured branch coverage: 81%.
+- Host Python suite: 71 passed.
+- Guest Python suite: 87 passed.
+- Combined measured branch coverage: 82%.
 - Patched spice-gtk Meson suite: 13 passed.
+- CI-style optional-feature-disabled Meson suite: 12 passed.
 - `git diff --check`: clean at report update time.
+
+After the portable `linkat(2)` publication fix (`04edcf7`), the installed guest
+helper was updated and restarted on the same Ubuntu 26.04 VM. A fresh physical
+Nautilus drag through the patched virt-manager console resolved guest
+coordinates `(506, 334)` to the open `file:///home/oki/Documents` window and
+published `~/Documents/live-linkat.txt`. Host and guest SHA-256 were both
+`39e2aa282367c466584e14a4239458261b0fc40b174ab8b942453a3e0c3008f6`.
+The journal recorded the matching `drop`, `ready`, `moved`, and `complete`
+sequence. This confirms the CI-driven portability fix in the live guest path,
+not only in mocked tests. A supplemental direct guest-filesystem publication
+check pre-created the same destination name; the installed helper retained its
+original contents and published the incoming inode as `same (1).txt`. The
+retained/incoming SHA-256 values were respectively
+`0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5` and
+`3a7470e00c076b678c41c8ae4a4945198a9e243cdb42e044612535facb5f225d`.
+The final helper was then deployed byte-for-byte to the guest (SHA-256
+`ca8c02d440028da4ec9486e2b3b9ce1f9701c771e2e01f97c48169f6ae605c05`);
+an injected live `EPERM` descriptor-link failure successfully selected the
+exclusive-copy fallback, and the user service remained active.
 
 The isolated installer completed from a clean build directory. Its launchers
 loaded the private spice-gtk and staged usbredir/libusb runtime rather than
@@ -137,10 +158,16 @@ the defined XML. A live tooling cycle was also performed while only
 `ubuntu-2604` was shut off: `disable-vm.sh` removed only the exact DnD channel
 and created a mode-0600 backup; `enable-vm.sh` restored it and created another
 mode-0600 backup. The inactive XML before disable and after re-enable was
-identical. After restart, the same IP, device, ACL, helper/agent status,
+identical, with SHA-256
+`14b4993bc42d42a367843c9f4721fa3f080e08ae9c0415926b063ae590535888` both
+before and after. The final cycle passed candidate XML to `virsh define --validate`
+through an inherited anonymous descriptor, eliminating the replaceable
+candidate pathname. After restart, the same IP, device, ACL, helper/agent status,
 connected journal event, and QEMU spiceport/virtserialport arguments were
-reverified. `uninstall.sh` removes only the isolated host build, not packages or
-domain XML.
+reverified. The default state directory's pre-existing project parent had
+legacy mode `0775`; the final secure controller migrated only that owned path
+to `0700`, then repeated the live disable/enable cycle successfully.
+`uninstall.sh` removes only the isolated host build, not packages or domain XML.
 
 ## Remaining limitations
 
@@ -159,6 +186,13 @@ domain XML.
    window; post-define semantic verification detects an unexpected result.
 5. The feature remains a source-built development patch. No upstream PR was
    submitted.
+6. spice-gtk's public transfer API accepts path-backed `GFile` objects, not
+   already-open descriptors. The host revalidates type, size, device and inode
+   immediately before starting payload transfer, but a same-user/shared-source
+   directory rename race remains before spice-gtk asynchronously opens that
+   path. A shared-layer fix should extend the payload API for a pinned stream or
+   create an asynchronous private snapshot while retaining the original guest
+   filename.
 
 The recommended upstream split is a generic cancellable/deferred drop API plus
 coordinate exposure in spice-gtk, with the frontend-neutral semantic policy as
